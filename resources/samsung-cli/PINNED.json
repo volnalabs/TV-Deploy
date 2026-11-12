@@ -1,0 +1,9 @@
+{
+  "upstream": "https://github.com/Samsung/tizen-agent-skills",
+  "path": "tizen-sdk-skills/common/{lib,assets/samsung-tv-ca}",
+  "commit": "1509f7b9c5f659dda2222ce4264a3a3a35cbbe69",
+  "upstream_version": "1.7.0",
+  "license": "Apache-2.0",
+  "tree_sha256": "78880e81a3b751188813f1ca6b62fef05091d9765ddc585a68671748e68a4285",
+  "note": "lib/tests removed; common/tools (dlog-analyzer binaries) NOT redistributed. Update with scripts/vendor-samsung-cli.sh"
+}

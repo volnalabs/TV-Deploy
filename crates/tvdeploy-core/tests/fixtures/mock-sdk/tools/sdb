@@ -1,0 +1,11 @@
+#!/bin/sh
+# MOCK sdb for testing the Samsung CLI plumbing. Not a real TV.
+case "$*" in
+  *"start-server"*|*"kill-server"*) exit 0;;
+  "devices"*) printf 'List of devices attached\n192.168.1.5:26101\tdevice\tMockTV\n';;
+  "connect "*) echo "connected to $2";;
+  "disconnect "*) echo "disconnected $2";;
+  *"capability"*) printf 'secure_protocol:disabled\nplatform_version:9.0\nmodel_name:MockTV\n';;
+  *"shell"*) echo "MOCKDUID1234ABCD";;
+  *) echo "mock sdb: unhandled: $*" >&2; exit 1;;
+esac

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+resources/node/*
+!resources/node/.gitkeep
+*.p12
+*.pfx
+*.pwd
+.env
+.env.*

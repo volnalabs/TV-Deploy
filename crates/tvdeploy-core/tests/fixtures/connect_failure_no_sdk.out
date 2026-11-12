@@ -1,0 +1,19 @@
+[tizen-sdk] Using default SDK path: <HOME>/tizen-sdk
+{
+  "status": "failure",
+  "errors": [
+    {
+      "error_code": "TIZEN_SDK_CONFIG_E001",
+      "error_category": "sdk_path_not_set",
+      "message": "sdb not found at <HOME>/tizen-sdk/tools/sdb and not on PATH. Run tizen-sdk-init with the correct SDK path.",
+      "suggested_fix": {
+        "command": "tizen-sdk sdk-init --sdk-path <path>",
+        "auto_fixable": false,
+        "guide_url": "https://docs.tizen.org/application/native/tutorials/setup/"
+      }
+    }
+  ],
+  "command": "tizen-sdk remote-device connect",
+  "user_command": "node remote-device-cli.js connect 192.0.2.1",
+  "duration_ms": 0
+}

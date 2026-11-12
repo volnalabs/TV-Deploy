@@ -1,0 +1,15 @@
+{
+  "status": "success",
+  "result": {
+    "device_serial": "192.168.1.5:26101",
+    "ip": "192.168.1.5",
+    "port": 26101,
+    "status": "connected",
+    "attempts": 1
+  },
+  "warnings": [],
+  "errors": [],
+  "command": "tizen-sdk remote-device connect",
+  "user_command": "node remote-device-cli.js connect 192.168.1.5 --port 26101",
+  "duration_ms": 13
+}

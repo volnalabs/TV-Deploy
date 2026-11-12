@@ -1,0 +1,14 @@
+{
+  "status": "success",
+  "result": {
+    "duid": "MOCKDUID1234ABCD",
+    "serial": "192.168.1.5:26101",
+    "deviceName": "",
+    "command": "/opt/etc/duid-gadget 2.0 2> /dev/null"
+  },
+  "warnings": [],
+  "errors": [],
+  "command": "tizen-sdk certificate-manager acquire-duid",
+  "user_command": "node cert-manager-cli.js acquire-duid --serial 192.168.1.5:26101",
+  "duration_ms": 0
+}

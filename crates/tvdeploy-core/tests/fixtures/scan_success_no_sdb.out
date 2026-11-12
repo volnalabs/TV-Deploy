@@ -1,0 +1,20 @@
+[tizen-remote-device] Scanning 127.0.0.0/24 on port 26101 (timeout 300ms per host)
+[tizen-sdk] Using default SDK path: <HOME>/tizen-sdk
+{
+  "status": "success",
+  "result": {
+    "subnets_scanned": [
+      "127.0.0.0/24"
+    ],
+    "port": 26101,
+    "device_count": 0,
+    "devices": []
+  },
+  "warnings": [
+    "sdb unavailable — connection status not checked (sdb not found at <HOME>/tizen-sdk/tools/sdb and not on PATH. Run tizen-sdk-init with the correct SDK path.)"
+  ],
+  "errors": [],
+  "command": "tizen-sdk remote-device scan",
+  "user_command": "node remote-device-cli.js scan 127.0.0 --timeout 300",
+  "duration_ms": 51
+}
