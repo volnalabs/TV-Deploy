@@ -1,0 +1,20 @@
+[package]
+name = "tv-deploy"
+description = "A simple and modern application installer for Samsung Smart TVs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "tv_deploy_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tvdeploy-core = { path = "../crates/tvdeploy-core" }
