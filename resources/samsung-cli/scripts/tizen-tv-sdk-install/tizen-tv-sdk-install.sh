@@ -1,0 +1,427 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Samsung Electronics Co., Ltd.
+
+# tizen-tv-sdk-install.sh
+# Tizen TV SDK extension installer for Linux/macOS
+#
+# - Downloads pkg_list from https://download.tizen.org/sdk/extensions/tv_extensions/
+# - Installs TV-SAMSUNG-Public package and its dependencies
+# - Merges data/ into the existing Tizen SDK root
+# - Records the TV version in .platform-installed and creates the
+#   .tv-sdk-installed marker on success
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Shared helpers: get_sdk_path, pkg_os_base (lib/common.sh).
+source "$SCRIPT_DIR/../lib/common.sh"
+require_bash4 "$@"
+
+# TV SDK extension repository
+PKG_REPO="https://download.tizen.org/sdk/extensions/tv_extensions"
+TARGET_PACKAGE="TV-SAMSUNG-Public"
+
+# Detect OS -> pkg_list token (windows | ubuntu | macos)
+OS="$(uname -s)"
+PKG_OS_BASE="$(pkg_os_base)"
+case "$PKG_OS_BASE" in
+    windows) echo "[WARN] Running in Windows Git Bash/MSYS2 — consider using the PowerShell script (.ps1) instead." ;;
+    "")      echo "[ERROR] Unsupported OS: $OS"; exit 1 ;;
+esac
+PKG_OS="${PKG_OS_BASE}-64"
+
+
+# Defaults (SDK path resolution: TIZEN_SDK_PATH -> ~/.tizen.sdk.path.config -> ~/tizen-sdk)
+SDK_PATH="$(get_sdk_path)"
+FORCE=false
+DOWNLOAD_JOBS=4
+CHECK=false
+DRY_RUN=false
+WAIT=false
+STATUS=false
+DETACH=false
+DETACH_LOG="/tmp/tizen-tv-sdk-install.log"
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sdk-path=*) SDK_PATH="${1#*=}"; shift ;;
+        --sdk-path)   SDK_PATH="$2"; shift 2 ;;
+        --force)      FORCE=true; shift ;;
+        --download-jobs) DOWNLOAD_JOBS="${2:-}"; validate_download_jobs "$DOWNLOAD_JOBS" || exit 2; shift 2 ;;
+        --download-jobs=*) DOWNLOAD_JOBS="${1#*=}"; validate_download_jobs "$DOWNLOAD_JOBS" || exit 2; shift ;;
+        --check)      CHECK=true; shift ;;
+        --dry-run)    DRY_RUN=true; shift ;;
+        --wait)       WAIT=true; shift ;;
+        --status)     STATUS=true; shift ;;
+        --detach)     DETACH=true; shift ;;
+        --help|-h)
+            cat <<EOF
+Tizen TV SDK extension installer
+
+Usage: $0 [OPTIONS]
+
+Options:
+  --sdk-path <path>   Tizen SDK installation path
+                      (default: TIZEN_SDK_PATH / ~/.tizen.sdk.path.config / ~/tizen-sdk)
+  --force             Reinstall even if TV SDK is already installed
+  --check             Check TV SDK installation only
+  --dry-run           Resolve and list packages only (no download/install)
+  --detach            Launch the install in the background (log: $DETACH_LOG)
+  --status            Print STATUS=running | STATUS=done EXIT=<code> and exit
+  --help              Show this help
+
+What it does:
+  1) Verifies Tizen SDK is installed (sdk.info exists)
+  2) Downloads/parses ${PKG_REPO}/pkg_list_${PKG_OS}
+  3) Resolves ${TARGET_PACKAGE} and its Install-dependency packages
+  4) Downloads each from (repo + Path) and merges data/ into the SDK root
+  5) Records the TV version (from its X.Y-MANDATORY dependency) in
+     .platform-installed and creates the .tv-sdk-installed marker on success
+EOF
+            exit 0 ;;
+        *) echo "[ERROR] Unknown option: $1"; exit 1 ;;
+    esac
+done
+
+# --status: report whether a background install is still running.
+# --wait: the same, after a 60-second sleep. The skills tell Cline to poll with
+# `sleep 25 && --status` instead, because --wait exceeds its 30 s tool timeout.
+if [[ "$WAIT" == "true" || "$STATUS" == "true" ]]; then
+    [[ "$WAIT" == "true" ]] && sleep 60
+    TV_SDK_MARKER="${SDK_PATH}/.tv-sdk-installed"
+    if [[ -f "$TV_SDK_MARKER" ]]; then
+        echo "STATUS=done EXIT=0"
+    elif installer_running "tizen-tv-sdk-install.sh"; then
+        echo "STATUS=running"
+    else
+        echo "STATUS=done EXIT=1"
+    fi
+    exit 0
+fi
+
+# --detach: re-launch in the background and return at once, for harnesses
+# (e.g. Cline) without a completion notification; poll with --status.
+# Forward every option that changes what gets installed, and --force only
+# when it was given.
+if [[ "$DETACH" == "true" ]]; then
+    detach_args=(--sdk-path="$SDK_PATH" --download-jobs "$DOWNLOAD_JOBS")
+    [[ "$FORCE" == "true" ]] && detach_args+=(--force)
+    nohup bash "$0" "${detach_args[@]}" > "$DETACH_LOG" 2>&1 &
+    jobs -p
+    echo "LOG=$DETACH_LOG"
+    exit 0
+fi
+
+# Wall-clock timer for the whole run, printed at every real exit point below.
+SCRIPT_START=$SECONDS
+
+echo "[INFO] Tizen TV SDK extension installer started"
+echo "[INFO] SDK path: $SDK_PATH"
+echo "[INFO] Target package: $TARGET_PACKAGE"
+echo "[INFO] Detected OS: $OS (pkg_list: pkg_list_$PKG_OS)"
+
+# Verify Tizen SDK is installed
+SDK_INFO_PATH="${SDK_PATH}/sdk.info"
+if [[ ! -f "$SDK_INFO_PATH" ]]; then
+    echo "[ERROR] Tizen SDK is NOT installed at $SDK_PATH (sdk.info not found)"
+    echo "[ERROR] TV SDK requires Tizen SDK to be installed first."
+    echo "[ERROR] Run the tizen-sdk-install skill to install Tizen SDK, then retry."
+    exit 1
+fi
+echo "[OK] Tizen SDK found: $SDK_PATH (sdk.info exists)"
+
+# An older install left only .tv-sdk-installed: record its TV version first
+# (migrate_tv_sdk_marker, lib/common.sh), so it is still reported after this
+# run replaces the marker.
+TV_SDK_MARKER="${SDK_PATH}/.tv-sdk-installed"
+[[ "$DRY_RUN" == "true" ]] || migrate_tv_sdk_marker "$SDK_PATH" || true
+
+# The TV versions tizen-tv-sdk-install recorded (the online repository
+# carries one TV version, so any of them means it is in).
+# Read through platform_record_blocks (lib/common.sh), the parser every
+# reader shares.
+online_tv_versions() {
+    platform_record_blocks "$SDK_PATH" | awk -F'\t' '$2 == "tv-sdk-install" { print $1 }' \
+        | sort -u | paste -sd, - | sed 's/,/, /g'
+}
+
+# Check mode
+if [[ "$CHECK" == "true" ]]; then
+    RECORDED="$(online_tv_versions)"
+    if [[ -n "$RECORDED" ]]; then
+        echo "[OK] TV SDK is already installed: $SDK_PATH (TV $RECORDED recorded in .platform-installed)"
+        exit 0
+    else
+        echo "[INFO] TV SDK is NOT installed (no tv-sdk-install record in .platform-installed)"
+        exit 1
+    fi
+fi
+
+# Skip if already installed
+RECORDED="$(online_tv_versions)"
+if [[ -n "$RECORDED" && "$FORCE" == "false" && "$DRY_RUN" == "false" ]]; then
+    echo "[OK] TV SDK is already installed: $SDK_PATH (TV $RECORDED)"
+    echo "[INFO] Recorded in .platform-installed. To reinstall, run again with --force"
+    exit 0
+fi
+
+# --status reports "done" once the marker exists, so drop the previous run's
+# marker before this one starts (its version is recorded above).
+[[ "$DRY_RUN" == "true" ]] || rm -f "$TV_SDK_MARKER"
+
+# -----------------------------------------------------------------------------
+# Package installation (pkg_list driven)
+# -----------------------------------------------------------------------------
+
+WORKDIR="$(mktemp -d -t tizen-tv-pkg-XXXXXX)"
+PKGLIST="${WORKDIR}/pkg_list"
+PKGLIST_URL="${PKG_REPO}/pkg_list_${PKG_OS}"
+
+echo "[INFO] Downloading package list: $PKGLIST_URL"
+if ! curl -fsSL -o "$PKGLIST" "$PKGLIST_URL"; then
+    echo "[ERROR] Failed to download pkg_list from $PKGLIST_URL"
+    rm -rf "$WORKDIR"
+    exit 1
+fi
+
+# Parse pkg_list into associative arrays
+declare -A PKG_PATH PKG_VERSION PKG_DEPS
+
+CUR=""
+while IFS= read -r line; do
+    if [[ "$line" =~ ^Package\ :\ (.+)$ ]]; then
+        CUR="${BASH_REMATCH[1]//$'\r'/}"
+        if [[ -z "${PKG_PATH[$CUR]+x}" ]]; then
+            PKG_PATH[$CUR]=""
+            PKG_VERSION[$CUR]=""
+            PKG_DEPS[$CUR]=""
+        fi
+    elif [[ -n "$CUR" ]]; then
+        if [[ "$line" =~ ^Version\ :\ (.+)$ ]] && [[ -z "${PKG_VERSION[$CUR]}" ]]; then
+            PKG_VERSION[$CUR]="${BASH_REMATCH[1]//$'\r'/}"
+            PKG_VERSION[$CUR]="${PKG_VERSION[$CUR]#"${PKG_VERSION[$CUR]%%[![:space:]]*}"}"
+        elif [[ "$line" =~ ^Path\ :\ (.+)$ ]] && [[ -z "${PKG_PATH[$CUR]}" ]]; then
+            PKG_PATH[$CUR]="${BASH_REMATCH[1]//$'\r'/}"
+            PKG_PATH[$CUR]="${PKG_PATH[$CUR]#"${PKG_PATH[$CUR]%%[![:space:]]*}"}"
+        elif [[ "$line" =~ ^Install-dependency\ :\ (.+)$ ]] && [[ -z "${PKG_DEPS[$CUR]}" ]]; then
+            DEPS_STR="${BASH_REMATCH[1]//$'\r'/}"
+            DEPS=""
+            IFS=',' read -ra DEP_ENTRIES <<< "$DEPS_STR"
+            for entry in "${DEP_ENTRIES[@]}"; do
+                e="$(echo "$entry" | sed 's/\[.*\]//' | xargs)"
+                if [[ -n "$e" ]]; then
+                    if [[ -z "$DEPS" ]]; then
+                        DEPS="$e"
+                    else
+                        DEPS="$DEPS $e"
+                    fi
+                fi
+            done
+            PKG_DEPS[$CUR]="$DEPS"
+        fi
+    fi
+done < "$PKGLIST"
+
+# Verify target package exists
+if [[ -z "${PKG_PATH[$TARGET_PACKAGE]+x}" ]]; then
+    echo "[ERROR] Target package not found in pkg_list: $TARGET_PACKAGE"
+    rm -rf "$WORKDIR"
+    exit 1
+fi
+
+echo "[OK] Target package found: $TARGET_PACKAGE (version ${PKG_VERSION[$TARGET_PACKAGE]})"
+
+# Recursively resolve dependencies
+declare -A SEEN
+RESOLVED=()
+QUEUE=("$TARGET_PACKAGE")
+while [[ ${#QUEUE[@]} -gt 0 ]]; do
+    CUR_PKG="${QUEUE[0]}"
+    QUEUE=("${QUEUE[@]:1}")
+    if [[ -n "${SEEN[$CUR_PKG]+x}" ]]; then continue; fi
+    SEEN[$CUR_PKG]=1
+    RESOLVED+=("$CUR_PKG")
+    if [[ -n "${PKG_DEPS[$CUR_PKG]+x}" ]]; then
+        for dep in ${PKG_DEPS[$CUR_PKG]}; do
+            if [[ -z "${SEEN[$dep]+x}" ]]; then
+                QUEUE+=("$dep")
+            fi
+        done
+    fi
+done
+
+TOTAL=${#RESOLVED[@]}
+echo "[OK] Total resolved packages: $TOTAL"
+
+# The TV version is the X.Y of the X.Y-MANDATORY platform meta it depends on
+# (TV-SAMSUNG-Public-Mandatory -> 10.0-MANDATORY).
+TV_VERSION=""
+for pkg in "${RESOLVED[@]}"; do
+    if [[ "$pkg" =~ ^([0-9]+\.[0-9]+)-MANDATORY$ ]]; then
+        if [[ -z "$TV_VERSION" ]] || version_gt "${BASH_REMATCH[1]}" "$TV_VERSION"; then
+            TV_VERSION="${BASH_REMATCH[1]}"
+        fi
+    fi
+done
+if [[ -n "$TV_VERSION" ]]; then
+    echo "[OK] TV platform version: $TV_VERSION"
+    # The same TV version may already be in (e.g. from a ZIP).
+    if [[ "$FORCE" == "false" && "$DRY_RUN" == "false" ]] && tv_version_recorded "$SDK_PATH" "$TV_VERSION"; then
+        echo "[OK] TV SDK $TV_VERSION is already installed: $SDK_PATH (recorded in .platform-installed)"
+        echo "[INFO] To reinstall, run again with --force"
+        rm -rf "$WORKDIR"
+        exit 0
+    fi
+else
+    echo "[WARN] No X.Y-MANDATORY dependency found; the TV version is taken from platforms/ after the install"
+fi
+
+# Dry-run: list only
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[WARN] [DRY-RUN] The following packages would be installed (no download/install):"
+    n=0
+    for pkg in "${RESOLVED[@]}"; do
+        n=$((n+1))
+        p="${PKG_PATH[$pkg]:-<no-binary>}"
+        printf "  %3d. %-48s %s\n" "$n" "$pkg" "$p"
+    done
+    rm -rf "$WORKDIR"
+    echo "[INFO] Total time: $(format_duration $((SECONDS - SCRIPT_START)))"
+    exit 0
+fi
+
+# Download and merge each package
+PKG_INFO_DIR="${SDK_PATH}/.package"
+mkdir -p "$PKG_INFO_DIR"
+
+DOWNLOAD_QUEUE="$WORKDIR/download.queue"; DOWNLOAD_RESULTS="$WORKDIR/downloads"
+: > "$DOWNLOAD_QUEUE"
+
+IDX=0; OK=0; SKIP=0; FAIL=0
+# Pass 1: decide skips (already installed / meta) BEFORE anything is
+# downloaded, so a re-run only fetches what it will actually install.
+WORK_ITEMS=()   # "<idx>\t<pkg>" per package that needs download + install
+for pkg in "${RESOLVED[@]}"; do
+    IDX=$((IDX+1))
+
+    # Skip if already installed (manifest exists), unless --force
+    if [[ "$FORCE" == "false" && -f "${PKG_INFO_DIR}/${pkg}.manifest" ]]; then
+        echo "[INFO] [$IDX/$TOTAL] $pkg already installed, skip"
+        SKIP=$((SKIP+1))
+        continue
+    fi
+
+    REL_PATH="${PKG_PATH[$pkg]:-}"
+    if [[ -z "$REL_PATH" ]]; then
+        echo "[WARN] [$IDX/$TOTAL] $pkg: no binary path (meta/skip)"
+        SKIP=$((SKIP+1))
+        continue
+    fi
+
+    printf '%s\t%s\t%s\n' "$pkg" "${PKG_REPO}${REL_PATH}" "$WORKDIR/$(basename "$REL_PATH")" >> "$DOWNLOAD_QUEUE"
+    WORK_ITEMS+=("$IDX"$'\t'"$pkg")
+done
+
+echo "[INFO] Downloading packages with $DOWNLOAD_JOBS parallel workers..."
+DOWNLOAD_START=$SECONDS
+download_queue_parallel "$DOWNLOAD_QUEUE" "$DOWNLOAD_JOBS" "$DOWNLOAD_RESULTS"
+echo "[INFO] Download phase took $(format_duration $((SECONDS - DOWNLOAD_START)))"
+EXTRACT_START=$SECONDS
+
+# Pass 2: extract + merge the packages queued above.
+for work_item in ${WORK_ITEMS[@]+"${WORK_ITEMS[@]}"}; do
+    IDX="${work_item%%$'\t'*}"
+    pkg="${work_item#*$'\t'}"
+    REL_PATH="${PKG_PATH[$pkg]}"
+    URL="${PKG_REPO}${REL_PATH}"
+    ZIP="${WORKDIR}/$(basename "$REL_PATH")"
+    echo "[INFO] [$IDX/$TOTAL] Processing downloaded $pkg ..."
+    if [[ "$(download_queue_status "$pkg" "$DOWNLOAD_RESULTS")" != "OK" ]]; then
+        echo "[ERROR] [$IDX/$TOTAL] Download failed: $URL"
+        FAIL=$((FAIL+1))
+        continue
+    fi
+
+    STAGE="${WORKDIR}/stage_${IDX}"
+    rm -rf "$STAGE"
+    mkdir -p "$STAGE"
+
+    if ! unzip -qo "$ZIP" -d "$STAGE" 2>/dev/null; then
+        echo "[ERROR] [$IDX/$TOTAL] Extraction failed: $pkg"
+        FAIL=$((FAIL+1))
+        rm -f "$ZIP"
+        rm -rf "$STAGE"
+        continue
+    fi
+
+    # Merge data/ contents into the SDK root
+    DATA_DIR="${STAGE}/data"
+    if [[ -d "$DATA_DIR" ]]; then
+        # Check if data/ has any contents (some packages have empty data/)
+        if [[ -n "$(ls -A "$DATA_DIR" 2>/dev/null)" ]]; then
+            if ! cp -rf "$DATA_DIR"/* "$SDK_PATH"/ 2>/dev/null; then
+                echo "[ERROR] [$IDX/$TOTAL] Merge failed: $pkg"
+                FAIL=$((FAIL+1))
+                rm -f "$ZIP"
+                rm -rf "$STAGE"
+                continue
+            fi
+        else
+            echo "[INFO] [$IDX/$TOTAL] $pkg: data/ is empty, skip merge"
+        fi
+    fi
+
+    # Keep manifest record
+    MANIFEST="${STAGE}/pkginfo.manifest"
+    if [[ -f "$MANIFEST" ]]; then
+        cp -f "$MANIFEST" "${PKG_INFO_DIR}/${pkg}.manifest"
+    fi
+
+    rm -f "$ZIP"
+    rm -rf "$STAGE"
+    OK=$((OK+1))
+done
+
+echo "[INFO] Extraction phase took $(format_duration $((SECONDS - EXTRACT_START)))"
+echo "[OK] TV SDK package result: OK $OK / skipped $SKIP / failed $FAIL (total $TOTAL)"
+
+if [[ $FAIL -gt 0 ]]; then
+    echo "[ERROR] Some packages failed to install. Not creating .tv-sdk-installed marker."
+    rm -rf "$WORKDIR"
+    echo "[INFO] Total time: $(format_duration $((SECONDS - SCRIPT_START)))"
+    exit 1
+fi
+
+# Record the TV version in .platform-installed (record_platform_install,
+# lib/common.sh) — what sdk-install result.packages and platform-install
+# --list read. Without an X.Y-MANDATORY dependency, the newest version that
+# now holds a tv-samsung payload is the one this package is for.
+if [[ -z "$TV_VERSION" ]]; then
+    for d in "$SDK_PATH"/platforms/*/; do
+        name="$(basename "$d" | tr '[:upper:]' '[:lower:]')"
+        [[ "$name" =~ ^tizen-([0-9]+\.[0-9]+)$ ]] || continue
+        [[ -n "$(tv_install_profiles "$SDK_PATH" "${BASH_REMATCH[1]}")" ]] || continue
+        if [[ -z "$TV_VERSION" ]] || version_gt "${BASH_REMATCH[1]}" "$TV_VERSION"; then
+            TV_VERSION="${BASH_REMATCH[1]}"
+        fi
+    done
+fi
+if [[ -n "$TV_VERSION" ]]; then
+    TV_PROFILES="$(tv_install_profiles "$SDK_PATH" "$TV_VERSION")"
+    record_platform_install "$SDK_PATH" "$TARGET_PACKAGE" "$TV_VERSION" "${TV_PROFILES:-tv-samsung}" tv-sdk-install "$PKG_REPO"
+    echo "[OK] TV $TV_VERSION (${TV_PROFILES:-tv-samsung}) recorded in $SDK_PATH/.platform-installed"
+else
+    echo "[WARN] Could not tell which TV version was installed; nothing recorded in .platform-installed"
+fi
+
+# Create .tv-sdk-installed marker
+echo "TV SDK installed at $(date +%Y-%m-%dT%H:%M:%S%z)" > "$TV_SDK_MARKER"
+[[ -z "$TV_VERSION" ]] || echo "TV version: $TV_VERSION" >> "$TV_SDK_MARKER"
+echo "[OK] .tv-sdk-installed created: $TV_SDK_MARKER"
+
+rm -rf "$WORKDIR"
+echo "[OK] Tizen TV SDK extension installation completed!"
+echo "[INFO] Total time: $(format_duration $((SECONDS - SCRIPT_START)))"
+exit 0
