@@ -94,7 +94,7 @@ export const en = {
 
   // install
   installButton: "Install on TV",
-  installSoon: "Installing apps arrives in the next update. Signing and installation are not available in this version.",
+  installSoon: "TV Deploy signs a temporary copy of your selected WGT and leaves the original file unchanged.",
   installNeedTv: "Connect a TV first",
   installNeedApp: "Choose an app first",
 
