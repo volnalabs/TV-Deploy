@@ -128,7 +128,7 @@ export const ru: Record<Key, string> = {
   "defaultPort": "Порт разработчика по умолчанию",
   "timeout": "Тайм-аут подключения (мс)",
   "settingsSaved": "Сохранено",
-  "invalidSetting": "Проверьте значения: порт 1–65535, тайм-аут 100–30000 мс."
+  "invalidSetting": "Проверьте значения: порт 1–65535, тайм-аут 100–30000 мс.",
 
   "setupAutoInstall": "Автоматически установить инструменты Samsung",
   "setupInstallExtension": "Установить Samsung TV Extension",
