@@ -1,0 +1,1296 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Samsung Electronics Co., Ltd.
+
+# common.ps1 - shared helpers for tizen-sdk-skills PowerShell scripts.
+#
+# Dot-source this near the top of each script:
+#   . (Join-Path $PSScriptRoot "..\lib\common.ps1")
+
+# ----------------------------------------------------------------------------
+# Force UTF-8 output so Korean (and other non-ASCII) text is not mojibake when
+# the output is captured by Cline / the Node CLI runners. Windows PowerShell 5.1
+# defaults console output to the active code page (e.g. cp949), which a UTF-8
+# consumer then decodes as garbage. Best-effort - wrapped so it never aborts.
+# ----------------------------------------------------------------------------
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::InputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+    # Also set the console code page to UTF-8 (65001) so child processes
+    # (tz, dotnet, sdb, etc.) emit UTF-8 output that PowerShell can capture
+    # correctly. Without this, tz/dotnet inherit the OEM code page (cp949)
+    # and their Korean output is mojibake when captured via 2>&1.
+    $null = chcp 65001
+} catch { }
+
+# ----------------------------------------------------------------------------
+# Logging
+# ----------------------------------------------------------------------------
+function Write-Info    { param([string]$Message) Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
+function Write-Success { param([string]$Message) Write-Host "[OK]    $Message" -ForegroundColor Green }
+function Write-Warn    { param([string]$Message) Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
+function Write-Err     { param([string]$Message) Write-Host "[ERROR] $Message" -ForegroundColor Red }
+function Write-Step    { param([string]$Message) Write-Host "[*] $Message" -ForegroundColor Green }
+function Write-Section {
+    param([string]$Message)
+    Write-Host ""
+    Write-Host "=== $Message ===" -ForegroundColor Cyan
+}
+
+# Formats a TimeSpan as "1h 2m 3s" / "2m 3s" / "3.4s", picking the coarsest
+# units that apply so a phase timing line stays short at any duration.
+function Format-Duration {
+    param([Parameter(Mandatory=$true)][TimeSpan]$Elapsed)
+    # [math]::Floor, not an [int] cast: PowerShell's [int] rounds to nearest,
+    # so 2m40s would print as "3m 40s".
+    if ($Elapsed.TotalHours -ge 1) {
+        return "{0}h {1}m {2}s" -f [math]::Floor($Elapsed.TotalHours), $Elapsed.Minutes, $Elapsed.Seconds
+    } elseif ($Elapsed.TotalMinutes -ge 1) {
+        return "{0}m {1}s" -f [math]::Floor($Elapsed.TotalMinutes), $Elapsed.Seconds
+    }
+    return "{0:N1}s" -f $Elapsed.TotalSeconds
+}
+
+# ----------------------------------------------------------------------------
+# Path normalisation
+# ----------------------------------------------------------------------------
+# Canonical Windows form of a path that may have arrived with forward slashes.
+# The Node layer passes install paths as "C:/Users/me/tizen-sdk" because a
+# trailing backslash would escape the closing quote on the command line, and
+# anything a script persists from such a value (User Path entries,
+# TIZEN_SDK_PATH, sdk.info, ~\.tizen.sdk.path.config) must not carry the slash
+# form or a mix of separators - "C:/Users/me/tizen-sdk\bin" is what users saw.
+#   - '/' becomes '\', then GetFullPath collapses "\\", "." and ".." segments
+#   - a relative path is anchored at PowerShell's $PWD (filesystem provider),
+#     not at the process working directory GetFullPath would otherwise use -
+#     the two differ after Set-Location, which is how Join-Path/Test-Path
+#     already resolved it before this helper existed
+#   - the trailing separator is dropped so "$p\bin" never yields "\\bin",
+#     except on a drive root: "C:" alone would mean "current dir on C:", so
+#     "C:\" is kept as is
+#   - a path GetFullPath rejects (invalid characters, too long on .NET
+#     Framework) falls back to the slash-replaced string, which is no worse
+#     than the verbatim value the callers used before
+function ConvertTo-CanonicalWindowsPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    $p = $Path.Trim() -replace '/', '\'
+    try {
+        if (-not [System.IO.Path]::IsPathRooted($p)) {
+            $p = Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $p
+        }
+        $p = [System.IO.Path]::GetFullPath($p)
+    } catch { }
+    $trimmed = $p.TrimEnd('\')
+    if ($trimmed -match '^[A-Za-z]:$') { return "$trimmed\" }
+    return $trimmed
+}
+
+# ----------------------------------------------------------------------------
+# Quote one value for Start-Process -ArgumentList, which joins the elements
+# with spaces and quotes none of them: a path with a space (a user profile
+# directory, for example) split into two arguments.
+# Backslashes right before the closing quote are doubled rather than trimmed:
+# Windows reads \" as an escaped quote, so "C:\tizen-sdk\" would swallow the
+# arguments after it, and trimming would turn a drive root "C:\" into "C:"
+# (the current directory on C:). "\\" followed by the quote reads as one
+# backslash, so the child gets the value unchanged.
+# ----------------------------------------------------------------------------
+function ConvertTo-QuotedArgument {
+    param([string]$Value)
+    return '"' + ($Value -replace '(\\+)$', '$1$1') + '"'
+}
+
+# ----------------------------------------------------------------------------
+# Is platform TIZEN-$Version installed in the SDK at $SdkPath? Mirror of
+# isTizenPlatformInstalled (lib/core/sdk.js) - the installers' "already
+# installed" check: platforms\tizen-X.Y must hold a platform profile - a
+# sub-directory besides "common" (which the base SDK ships for older API
+# versions too) and besides the TV extension's tv / tv-samsung* (which it lays
+# down for older versions too) - with content besides "samples" (which
+# tizen-create-project syncs templates into), and no tizen-platform-install
+# run of that version may still be marked in progress (.platform-installing-X.Y).
+#
+# Like the JS layer it matches "Tizen-12.0" (NTFS is case-insensitive) and
+# follows a junction or symbolic link to a profile directory (-Directory keeps
+# such entries); platform_installed in common.sh lowercases the name itself.
+# ----------------------------------------------------------------------------
+function Test-PlatformInstalled {
+    param([string]$SdkPath, [string]$Version)
+    if (-not $SdkPath -or -not $Version) { return $false }
+    if (Test-Path (Join-Path $SdkPath ".platform-installing-$Version")) { return $false }
+    $dir = Join-Path $SdkPath "platforms\tizen-$Version"
+    $profiles = Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne 'common' -and -not (Test-TvProfileName $_.Name) }
+    foreach ($p in $profiles) {
+        $payload = Get-ChildItem -Path $p.FullName -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'samples' }
+        if ($payload) { return $true }
+    }
+    return $false
+}
+
+# Profiles that belong to the TV extension, not to a TIZEN-X.Y platform.
+function Test-TvProfileName {
+    param([string]$Name)
+    return ($Name -eq 'tv' -or $Name -like 'tv-samsung*')
+}
+
+# ----------------------------------------------------------------------------
+# $SdkPath\.platform-installed records the platforms the user installed: one
+# block per successful install, appended by every installer. Mirror of
+# readPlatformRecords (lib/core/sdk.js) and record_platform_install
+# (lib/common.sh):
+#
+#   Platform package installed at 2026-11-03T10:00:00.0000000+09:00
+#   Target: TIZEN-11.0                   (TV-SAMSUNG-Public, TV-SAMSUNG ZIP)
+#   Platform version: 11.0
+#   Profile: tizen                       (tv-samsung; comma-separated list)
+#   Installed by: sdk-install            (platform-install, tv-sdk-install,
+#                                         tv-sdk-install-from-zip)
+#   Source: <repository URL or ZIP path> (optional)
+#
+# A block written before the Profile line existed gets it from its Target:
+# TV-... is tv-samsung, anything else is tizen.
+# ----------------------------------------------------------------------------
+
+# One object (Version, Profile, InstalledBy) per recorded profile. Callers wrap
+# the call in @(): no records means no output.
+function Get-PlatformRecords {
+    param([string]$SdkPath)
+    $file = Join-Path $SdkPath ".platform-installed"
+    if (-not (Test-Path -LiteralPath $file)) { return }
+    $blocks = New-Object System.Collections.Generic.List[hashtable]
+    $cur = $null
+    # ReadAllLines drops the BOM Windows PowerShell 5.1's Add-Content wrote.
+    foreach ($raw in [System.IO.File]::ReadAllLines($file)) {
+        $line = $raw.Trim()
+        if ($line.StartsWith('Platform package installed at')) {
+            $cur = @{ Version = ''; Profiles = ''; Target = ''; By = '' }
+            $blocks.Add($cur)
+            continue
+        }
+        if ($null -eq $cur) { continue }
+        if ($line -match '^Target:\s*(.*)$') { $cur.Target = $Matches[1] }
+        elseif ($line -match '^Platform version:\s*(.*)$') { $cur.Version = $Matches[1] }
+        elseif ($line -match '^Profile:\s*(.*)$') { $cur.Profiles = $Matches[1] }
+        elseif ($line -match '^Installed by:\s*(.*)$') { $cur.By = $Matches[1] }
+    }
+    foreach ($b in $blocks) {
+        if ($b.Version -notmatch '^[0-9]+\.[0-9]+$') { continue }
+        $list = $b.Profiles
+        if (-not $list) {
+            if ($b.Target -match '^TV-') { $list = 'tv-samsung' } else { $list = 'tizen' }
+        }
+        foreach ($p in ($list -split ',')) {
+            $p = $p.Trim()
+            if ($p) { [pscustomobject]@{ Version = $b.Version; Profile = $p; InstalledBy = $b.By } }
+        }
+    }
+}
+
+# Is profile $ProfileName of $Version recorded?
+function Test-PlatformRecorded {
+    param([string]$SdkPath, [string]$Version, [string]$ProfileName)
+    return (@(Get-PlatformRecords -SdkPath $SdkPath | Where-Object {
+        $_.Version -eq $Version -and $_.Profile -eq $ProfileName }).Count -gt 0)
+}
+
+# Is any TV profile (tv, tv-samsung*) of $Version recorded?
+function Test-TvVersionRecorded {
+    param([string]$SdkPath, [string]$Version)
+    return (@(Get-PlatformRecords -SdkPath $SdkPath | Where-Object {
+        $_.Version -eq $Version -and (Test-TvProfileName $_.Profile) }).Count -gt 0)
+}
+
+# platforms\tizen-$Version (any case: NTFS is case-insensitive), or $null.
+function Get-PlatformVersionDir {
+    param([string]$SdkPath, [string]$Version)
+    $dir = Join-Path $SdkPath "platforms\tizen-$Version"
+    if (Test-Path -LiteralPath $dir -PathType Container) { return $dir }
+    return $null
+}
+
+# Sub-directories of platforms\tizen-$Version that hold a payload (content
+# besides synced "samples"), filtered by $Filter.
+function Get-PayloadProfileNames {
+    param([string]$SdkPath, [string]$Version, [scriptblock]$Filter)
+    $dir = Get-PlatformVersionDir -SdkPath $SdkPath -Version $Version
+    if (-not $dir) { return }
+    foreach ($d in (Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue | Sort-Object Name)) {
+        if (-not (& $Filter $d.Name)) { continue }
+        $payload = Get-ChildItem -Path $d.FullName -Force -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -ne 'samples' }
+        if ($payload) { $d.Name }
+    }
+}
+
+# The non-TV profiles of platforms\tizen-$Version with a payload, comma-joined
+# ("tizen" when none) - what a TIZEN-X.Y install records as its Profile.
+function Get-PlatformInstallProfiles {
+    param([string]$SdkPath, [string]$Version)
+    $names = @(Get-PayloadProfileNames -SdkPath $SdkPath -Version $Version -Filter {
+        param($n) $n -ne 'common' -and -not (Test-TvProfileName $n) })
+    if ($names.Count -eq 0) { return 'tizen' }
+    return ($names -join ', ')
+}
+
+# The tv-samsung* profiles of platforms\tizen-$Version with a payload,
+# comma-joined, or '' - what a TV install records as its Profile.
+function Get-TvInstallProfiles {
+    param([string]$SdkPath, [string]$Version)
+    $names = @(Get-PayloadProfileNames -SdkPath $SdkPath -Version $Version -Filter {
+        param($n) $n -like 'tv-samsung*' })
+    return ($names -join ', ')
+}
+
+# Append one block to .platform-installed unless every profile in $Profiles
+# (comma-separated) is already recorded for $Version. Written without a BOM.
+function Add-PlatformRecord {
+    param(
+        [string]$SdkPath, [string]$Target, [string]$Version, [string]$Profiles,
+        [string]$InstalledBy, [string]$Source = ''
+    )
+    if (-not $Version -or -not $Profiles) { return }
+    $missing = $false
+    foreach ($p in ($Profiles -split ',')) {
+        $p = $p.Trim()
+        if ($p -and -not (Test-PlatformRecorded -SdkPath $SdkPath -Version $Version -ProfileName $p)) {
+            $missing = $true
+        }
+    }
+    if (-not $missing) { return }
+    $file = Join-Path $SdkPath ".platform-installed"
+    $prefix = ''
+    # A file whose last block lacks a newline would swallow the new first line.
+    if ((Test-Path -LiteralPath $file) -and (Get-Item -LiteralPath $file).Length -gt 0) {
+        $bytes = [System.IO.File]::ReadAllBytes($file)
+        if ($bytes[$bytes.Length - 1] -ne 10) { $prefix = "`n" }
+    }
+    $lines = @(
+        "Platform package installed at $(Get-Date -Format 'o')",
+        "Target: $Target",
+        "Platform version: $Version",
+        "Profile: $Profiles",
+        "Installed by: $InstalledBy"
+    )
+    if ($Source) { $lines += "Source: $Source" }
+    [System.IO.File]::AppendAllText($file, $prefix + ($lines -join "`n") + "`n", [System.Text.UTF8Encoding]::new($false))
+}
+
+# An SDK installed before sdk-install wrote records has its base platform
+# unrecorded; readers count it while no "Installed by: sdk-install" block
+# exists. Record it before a new sdk-install run writes its own block (mirror
+# of migrate_base_platform_record, lib/common.sh): the newest version that
+# Test-PlatformInstalled holds and no non-TV block records yet. Call it
+# before the run changes platforms\.
+function Convert-BasePlatformToRecord {
+    param([string]$SdkPath)
+    # Through Get-PlatformRecords, like every reader: a line outside a block,
+    # or a block without a valid X.Y version, does not count.
+    $records = @(Get-PlatformRecords -SdkPath $SdkPath)
+    if (@($records | Where-Object { $_.InstalledBy -eq 'sdk-install' }).Count -gt 0) { return }
+    $base = $null
+    foreach ($d in (Get-ChildItem -Path (Join-Path $SdkPath "platforms") -Directory -ErrorAction SilentlyContinue)) {
+        if ($d.Name -notmatch '^tizen-([0-9]+\.[0-9]+)$') { continue }
+        $v = $Matches[1]
+        if (-not (Test-PlatformInstalled -SdkPath $SdkPath -Version $v)) { continue }
+        if (@($records | Where-Object { $_.Version -eq $v -and -not (Test-TvProfileName $_.Profile) }).Count -gt 0) { continue }
+        if ($null -eq $base -or [version]$v -gt [version]$base) { $base = $v }
+    }
+    if (-not $base) { return }
+    Add-PlatformRecord -SdkPath $SdkPath -Target "TIZEN-$base" -Version $base `
+        -Profiles (Get-PlatformInstallProfiles -SdkPath $SdkPath -Version $base) -InstalledBy "sdk-install"
+}
+
+# An SDK whose TV extension was installed before the TV installers wrote
+# records has only .tv-sdk-installed. Turn it into a record before a new TV
+# install replaces that marker (mirror of migrate_tv_sdk_marker, lib/common.sh):
+# its "TV milestone version" (a ZIP install, which also wrote "Source:"), else
+# the newest version with a tv-samsung payload (the online install).
+function Convert-TvSdkMarkerToRecord {
+    param([string]$SdkPath)
+    $marker = Join-Path $SdkPath ".tv-sdk-installed"
+    if (-not (Test-Path -LiteralPath $marker)) { return }
+    if (@(Get-PlatformRecords -SdkPath $SdkPath | Where-Object { Test-TvProfileName $_.Profile }).Count -gt 0) { return }
+    $text = [System.IO.File]::ReadAllText($marker)
+    $version = ''
+    $source = ''
+    if ($text -match '(?m)^TV milestone version:\s*([0-9]+\.[0-9]+)') { $version = $Matches[1] }
+    if ($text -match '(?m)^Source:\s*(.+?)\s*$') { $source = $Matches[1] }
+    if (-not $version -or -not (Get-TvInstallProfiles -SdkPath $SdkPath -Version $version)) {
+        $version = ''
+        $best = $null
+        foreach ($d in (Get-ChildItem -Path (Join-Path $SdkPath "platforms") -Directory -ErrorAction SilentlyContinue)) {
+            if ($d.Name -notmatch '^tizen-([0-9]+\.[0-9]+)$') { continue }
+            $v = $Matches[1]
+            if (-not (Get-TvInstallProfiles -SdkPath $SdkPath -Version $v)) { continue }
+            if ($null -eq $best -or [version]$v -gt [version]$best) { $best = $v }
+        }
+        if ($best) { $version = $best }
+    }
+    if (-not $version) { return }
+    $profiles = Get-TvInstallProfiles -SdkPath $SdkPath -Version $version
+    if ($source) {
+        Add-PlatformRecord -SdkPath $SdkPath -Target "TV-SAMSUNG ZIP" -Version $version -Profiles $profiles -InstalledBy "tv-sdk-install-from-zip" -Source $source
+    } else {
+        Add-PlatformRecord -SdkPath $SdkPath -Target "TV-SAMSUNG-Public" -Version $version -Profiles $profiles -InstalledBy "tv-sdk-install"
+    }
+}
+
+# ----------------------------------------------------------------------------
+# SDK path resolution
+#   ~\.tizen.sdk.path.config -> TIZEN_SDK_PATH -> %USERPROFILE%\tizen-sdk -> C:\tizen-sdk
+# The config file is the path saved by sdk-init (the only source the Node lib's
+# readSdkPath() uses), so it comes FIRST and scripts and the JS layer agree on
+# the SDK location. TIZEN_SDK_PATH is a secondary hint (issue #70: a profile
+# `TIZEN_SDK_PATH=~/tizen-studio` shadowed the configured tizen-sdk).
+# Returns the first candidate that actually CONTAINS the tizen-sdk tools, so a
+# stale/wrong TIZEN_SDK_PATH (e.g. pointing at Tizen Studio) is skipped in
+# favor of a real tizen-sdk install. Falls back to %USERPROFILE%\tizen-sdk if none validate.
+# ----------------------------------------------------------------------------
+function Test-IsTizenStudio {
+    param([string]$Dir)
+    if ([string]::IsNullOrWhiteSpace($Dir)) { return $false }
+    # Tizen Studio (the IDE distribution) ships tools\ide and no tools\tizen-core.
+    try {
+        return (Test-Path (Join-Path $Dir "tools\ide" -ErrorAction Stop)) -and
+               -not (Test-Path (Join-Path $Dir "tools\tizen-core" -ErrorAction Stop))
+    } catch {
+        return $false
+    }
+}
+
+function Test-IsTizenSdk {
+    param([string]$Dir)
+    if ([string]::IsNullOrWhiteSpace($Dir)) { return $false }
+    # A real tizen-sdk has the tizen-core tools (tz) under tools\; a bare sdb is
+    # accepted too (older layouts) unless the directory is a Tizen Studio
+    # install, which also ships tools\sdb.
+    # Join-Path throws on a non-existent drive (e.g. a stale TIZEN_SDK_PATH like
+    # X:\sdk) and that noise would end up in the caller's error details, so any
+    # candidate that cannot even be joined is simply "not an SDK".
+    try {
+        if (Test-Path (Join-Path $Dir "tools\tizen-core" -ErrorAction Stop)) { return $true }
+        $hasSdb = (Test-Path (Join-Path $Dir "tools\sdb.exe" -ErrorAction Stop)) -or
+                  (Test-Path (Join-Path $Dir "tools\sdb" -ErrorAction Stop))
+        if (-not $hasSdb) { return $false }
+        return -not (Test-IsTizenStudio $Dir)
+    } catch {
+        return $false
+    }
+}
+
+function Get-ConfiguredSdkPath {
+    $configFile = Join-Path $env:USERPROFILE ".tizen.sdk.path.config"
+    if (-not (Test-Path $configFile)) { return "" }
+    try {
+        $configured = (Get-Content $configFile -TotalCount 1 -ErrorAction Stop)
+        if ($configured) { return $configured.Trim() }
+    } catch { }
+    return ""
+}
+
+function Get-SdkPath {
+    $candidates = @()
+    $configured = Get-ConfiguredSdkPath
+    if ($configured) { $candidates += $configured }
+    if (-not [string]::IsNullOrWhiteSpace($env:TIZEN_SDK_PATH)) { $candidates += $env:TIZEN_SDK_PATH }
+    $candidates += (Join-Path $env:USERPROFILE "tizen-sdk")
+    $candidates += "C:\tizen-sdk"
+
+    foreach ($c in $candidates) {
+        if (Test-IsTizenSdk $c) { return $c }
+    }
+    # Nothing validated (SDK probably not installed) - default to the standard path.
+    return (Join-Path $env:USERPROFILE "tizen-sdk")
+}
+
+# Where a NEW SDK install goes when the caller gave no -Path: the configured
+# path (sdk-init / a previous install), else TIZEN_SDK_PATH unless it points at
+# a Tizen Studio install, else %USERPROFILE%\tizen-sdk. The JS pre-check passes
+# -Path explicitly; this default only guards a hand-run installer (issue #70).
+function Get-DefaultSdkInstallPath {
+    $configured = Get-ConfiguredSdkPath
+    if ($configured) { return $configured }
+    if (-not [string]::IsNullOrWhiteSpace($env:TIZEN_SDK_PATH)) {
+        if (Test-IsTizenStudio $env:TIZEN_SDK_PATH) {
+            [Console]::Error.WriteLine("[WARN]  Ignoring TIZEN_SDK_PATH=$($env:TIZEN_SDK_PATH): that is a Tizen Studio install, not a tizen-sdk directory. Installing to $(Join-Path $env:USERPROFILE 'tizen-sdk') (pass -Path to override).")
+        } else {
+            return $env:TIZEN_SDK_PATH
+        }
+    }
+    return (Join-Path $env:USERPROFILE "tizen-sdk")
+}
+
+# ----------------------------------------------------------------------------
+# Tizen package repository (pkg_list) helpers
+#
+# A usable Tizen package repository serves a package list file named
+# pkg_list_{OS}-{ARCH} at its root, where OS is windows | ubuntu | macos and
+# ARCH is 64 or 32 (e.g. pkg_list_windows-64). A URL that does not serve such a
+# file for the CURRENT OS cannot drive an install, so a custom repository URL is
+# rejected up front instead of failing 100 downloads later. Both
+# tizen-sdk-install.ps1 and tizen-sdk-install-custom-repo.ps1 use these.
+# ----------------------------------------------------------------------------
+
+# The pkg_list OS token for this machine. Always "windows" here - these helpers
+# only ever run under PowerShell on Windows.
+function Get-PkgOsBase { return "windows" }
+
+# Trim whitespace and trailing slashes so "$url/pkg_list_x" never doubles a
+# slash (some servers 404 on "//pkg_list_...").
+function Get-NormalizedRepoUrl {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return "" }
+    return $Url.Trim().TrimEnd('/')
+}
+
+# Return $true when the URL serves content: HEAD first, then a 1-byte ranged GET
+# for servers that reject HEAD (405/501) - a repo can be perfectly usable and
+# still refuse HEAD, so a HEAD-only probe would produce false rejections.
+function Test-UrlExists {
+    param([string]$Url)
+
+    [Net.ServicePointManager]::SecurityProtocol = `
+        [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = "HEAD"
+        $req.Timeout = 30000
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $resp.Close()
+        if ($code -ge 200 -and $code -lt 400) { return $true }
+    } catch { }
+
+    try {
+        $req = [System.Net.HttpWebRequest]::Create($Url)
+        $req.Method = "GET"
+        $req.Timeout = 30000
+        $req.AddRange(0, 0)
+        $resp = $req.GetResponse()
+        $code = [int]$resp.StatusCode
+        $resp.Close()
+        if ($code -ge 200 -and $code -lt 400) { return $true }
+    } catch { }
+
+    return $false
+}
+
+# Validate a custom package repository URL.
+#
+# Returns the matched pkg_list OS-ARCH token (e.g. "windows-64") on success, or
+# $null after logging the reason when the URL is malformed or serves no
+# pkg_list_{OS}-{64,32}.
+function Test-PkgRepoUrl {
+    param([string]$Url)
+
+    $repo = Get-NormalizedRepoUrl $Url
+    if ([string]::IsNullOrWhiteSpace($repo)) {
+        Write-Err "Repository URL is empty"
+        return $null
+    }
+    if ($repo -notmatch '^https?://') {
+        # ASCII only inside string literals: this file has no UTF-8 BOM, so
+        # Windows PowerShell 5.1 decodes it with the ANSI code page and a
+        # multi-byte char (e.g. an em dash) can swallow the closing quote.
+        Write-Err "Repository URL must start with http:// or https:// - got: $repo"
+        return $null
+    }
+
+    $base = Get-PkgOsBase
+
+    Write-Step "=== Validating package repository URL ==="
+    Write-Info "Repository: $repo"
+
+    foreach ($arch in @('64', '32')) {
+        $candidate = "$repo/pkg_list_${base}-${arch}"
+        Write-Info "Probing $candidate"
+        if (Test-UrlExists $candidate) {
+            Write-Success "Valid repository - found pkg_list_${base}-${arch}"
+            return "${base}-${arch}"
+        }
+    }
+
+    Write-Err "Not a valid Tizen package repository: $repo"
+    Write-Err "Neither pkg_list_${base}-64 nor pkg_list_${base}-32 is reachable there."
+    Write-Err "A repository root must serve pkg_list_{OS}-{64,32} (OS = windows | ubuntu | macos)."
+    Write-Err "Expected e.g. $repo/pkg_list_${base}-64"
+    return $null
+}
+
+# ----------------------------------------------------------------------------
+# Locate a Tizen SDK tool.
+#   sdb lives at <sdk>\tools\sdb.exe
+#   everything else (tz, ...) lives at <sdk>\tools\tizen-core\<name>.exe
+# Returns the absolute path, or $null (with an error logged) if not found.
+# NOTE: nested Join-Path is used for Windows PowerShell 5.1 compatibility
+#       (multi-argument Join-Path is only supported in PowerShell 6+).
+# ----------------------------------------------------------------------------
+function Find-TizenTool {
+    param([string]$ToolName)
+
+    $sdkPath = Get-SdkPath
+
+    if ($ToolName -eq "sdb") {
+        $toolPath = Join-Path (Join-Path $sdkPath "tools") "sdb.exe"
+    } else {
+        $toolPath = Join-Path (Join-Path (Join-Path $sdkPath "tools") "tizen-core") "$ToolName.exe"
+    }
+
+    if (-not (Test-Path $toolPath)) {
+        Write-Err "Cannot find $ToolName at $toolPath"
+        return $null
+    }
+
+    return $toolPath
+}
+
+# ----------------------------------------------------------------------------
+# .NET SDK discovery.
+#
+# Every usable SDK host on the machine is enumerated and ranked by WHERE it came
+# from (lower tier wins):
+#   path        - the `dotnet` already on PATH
+#   dotnet_root - $env:DOTNET_ROOT
+#   official    - Microsoft install roots (Program Files, %LOCALAPPDATA%\Microsoft\dotnet, ~\.dotnet)
+#   bundled     - dotnets shipped inside a Tizen extension / SDK tree (...\sdktools\dotnet)
+# Within a tier, one that already carries the Tizen workload is preferred. The
+# workload is only a tie-breaker: it is what tizen-dotnet-setup installs, so it
+# must not flip the choice of SDK across tiers.
+#
+# Well-known bundled locations are probed directly; the recursive scan of the
+# whole profile is a fallback that runs only when nothing else turned up.
+# None of these functions modify the environment.
+# ----------------------------------------------------------------------------
+$script:DotnetTierOrder = @('path', 'dotnet_root', 'official', 'bundled')
+
+function Get-OfficialDotnetRoots {
+    $roots = @()
+    if ($env:ProgramFiles) { $roots += (Join-Path $env:ProgramFiles 'dotnet') }
+    if (${env:ProgramFiles(x86)}) { $roots += (Join-Path ${env:ProgramFiles(x86)} 'dotnet') }
+    if ($env:LOCALAPPDATA) { $roots += (Join-Path $env:LOCALAPPDATA 'Microsoft\dotnet') }
+    if ($env:USERPROFILE) { $roots += (Join-Path $env:USERPROFILE '.dotnet') }
+    return $roots
+}
+
+function Get-KnownBundledDotnetRoots {
+    $roots = @()
+    if ($env:USERPROFILE) {
+        $roots += (Join-Path $env:USERPROFILE '.tizen-extension-platform\server\sdktools\dotnet')
+    }
+    return $roots
+}
+
+# Classify a dotnet install root: 'official' (Microsoft install locations),
+# 'bundled' (inside a Tizen extension / SDK tree — may vanish on an extension
+# update), or 'other' (anything else, e.g. a custom -DotnetRoot).
+function Get-DotnetRootKind {
+    param([string]$Root)
+    if ([string]::IsNullOrWhiteSpace($Root)) { return 'other' }
+    $r = $Root.TrimEnd('\', '/')
+    foreach ($o in Get-OfficialDotnetRoots) {
+        if ($r -ieq $o.TrimEnd('\', '/')) { return 'official' }
+    }
+    if ($r -like '*\sdktools\dotnet' -or $r -like '*\.tizen-extension-platform\*' -or $r -like '*\tizen-sdk\*') {
+        return 'bundled'
+    }
+    return 'other'
+}
+
+# Follow symlinks / reparse points to the real executable. `dotnet` on PATH is
+# often NOT the real binary (app-execution aliases, symlinks), and Split-Path of
+# the alias would name a directory with no sdk/ at all.
+function Resolve-RealPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+
+        # PowerShell 7+ / .NET 6+: resolves a whole chain of links.
+        if ($item.PSObject.Methods.Name -contains 'ResolveLinkTarget') {
+            $final = $item.ResolveLinkTarget($true)
+            if ($final -and $final.FullName) { return $final.FullName }
+        }
+
+        # Windows PowerShell 5.1: .Target holds the reparse point destination.
+        $target = @($item.Target) | Where-Object { $_ } | Select-Object -First 1
+        if ($target) {
+            if (-not [System.IO.Path]::IsPathRooted($target)) {
+                $target = Join-Path (Split-Path -Parent $item.FullName) $target
+            }
+            $resolved = Resolve-Path -LiteralPath $target -ErrorAction SilentlyContinue
+            if ($resolved) { return $resolved.Path }
+        }
+
+        return $item.FullName
+    } catch {
+        return $Path
+    }
+}
+
+# SDK feature band, computed exactly the way Samsung's installer does
+# (major.minor.<first digit of patch>00): 10.0.302 -> 10.0.300, 9.0.304 -> 9.0.300.
+# Returns $null when the version string is not parseable.
+function Get-SdkBand {
+    param([string]$SdkVersion)
+    if ([string]::IsNullOrWhiteSpace($SdkVersion)) { return $null }
+    $parts = $SdkVersion.Split('.')
+    if ($parts.Count -lt 3 -or $parts[2].Length -lt 1) { return $null }
+    return "$($parts[0]).$($parts[1]).$($parts[2][0])00"
+}
+
+# Is the Tizen workload recorded as installed for this SDK band? This is the
+# install record `dotnet workload list` itself reads, minus the ~3 s that
+# command spends per invocation — cheap enough to ask of every candidate.
+function Test-TizenWorkloadRecord {
+    param([string]$Root, [string]$SdkVersion)
+    $band = Get-SdkBand $SdkVersion
+    if (-not $band) { return $false }
+    return (Test-Path -LiteralPath (Join-Path $Root "metadata\workloads\$band\InstalledWorkloads\tizen"))
+}
+
+# Probe one dotnet.exe. Returns a candidate object, or $null when the file is
+# missing, is a runtime-only host, or its root was already seen.
+function Test-DotnetCandidate {
+    param([string]$Tier, [string]$Exe, [hashtable]$Seen)
+    if ([string]::IsNullOrWhiteSpace($Exe) -or -not (Test-Path -LiteralPath $Exe)) { return $null }
+    $real = Resolve-RealPath $Exe
+    $root = Split-Path -Parent $real
+    $key = $root.TrimEnd('\', '/').ToLowerInvariant()
+    if ($Seen.ContainsKey($key)) { return $null }
+    $Seen[$key] = $true
+
+    # Must be a real SDK (lists at least one SDK), not a runtime-only host. The
+    # last line is the highest SDK — what `dotnet --version` resolves to absent a
+    # global.json, without letting a global.json in the CWD skew the answer.
+    $sdks = @((& $real --list-sdks) 2>$null | Where-Object { $_ })
+    if ($sdks.Count -eq 0) { return $null }
+    $version = (($sdks[-1] -split '\s+')[0])
+    $hasTizen = Test-TizenWorkloadRecord $root $version
+
+    return [pscustomobject]@{
+        Tier          = $Tier
+        Path          = $real
+        Root          = $root
+        Version       = $version
+        TizenWorkload = $hasTizen
+    }
+}
+
+function Get-DotnetCandidates {
+    $probes = @()
+    $onPath = Get-Command dotnet -ErrorAction SilentlyContinue
+    if ($onPath) { $probes += @{ tier = 'path'; exe = $onPath.Source } }
+    if (-not [string]::IsNullOrWhiteSpace($env:DOTNET_ROOT)) {
+        $probes += @{ tier = 'dotnet_root'; exe = (Join-Path $env:DOTNET_ROOT 'dotnet.exe') }
+    }
+    foreach ($r in Get-OfficialDotnetRoots) { $probes += @{ tier = 'official'; exe = (Join-Path $r 'dotnet.exe') } }
+    foreach ($r in Get-KnownBundledDotnetRoots) { $probes += @{ tier = 'bundled'; exe = (Join-Path $r 'dotnet.exe') } }
+
+    $seen = @{}
+    $found = @()
+    foreach ($p in $probes) {
+        $c = Test-DotnetCandidate $p.tier $p.exe $seen
+        if ($c) { $found += $c }
+    }
+
+    # Fallback only: walking the whole profile can take tens of seconds.
+    if ($found.Count -eq 0 -and $env:USERPROFILE) {
+        try {
+            Get-ChildItem -Path $env:USERPROFILE -Filter 'dotnet.exe' -Recurse -Depth 6 -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -like '*\sdktools\dotnet\dotnet.exe' } |
+                ForEach-Object {
+                    $c = Test-DotnetCandidate 'bundled' $_.FullName $seen
+                    if ($c) { $found += $c }
+                }
+        } catch { }
+    }
+    return $found
+}
+
+# Lowest tier first; within a tier prefer one that already has the Tizen workload.
+function Select-DotnetCandidate {
+    param([object[]]$Candidates)
+    foreach ($tier in $script:DotnetTierOrder) {
+        $inTier = @($Candidates | Where-Object { $_.Tier -eq $tier })
+        if ($inTier.Count -eq 0) { continue }
+        $withWorkload = @($inTier | Where-Object { $_.TizenWorkload })
+        if ($withWorkload.Count -gt 0) { return $withWorkload[0] }
+        return $inTier[0]
+    }
+    return $null
+}
+
+# Path of the best usable dotnet.exe on this machine, or $null.
+function Find-DotnetSdk {
+    $best = Select-DotnetCandidate @(Get-DotnetCandidates)
+    if ($best) { return $best.Path }
+    return $null
+}
+
+# ----------------------------------------------------------------------------
+# Run a native executable (sdb, python, ...) and return its stdout lines.
+#
+# Windows PowerShell 5.1 wraps every stderr line of a native command in a
+# NativeCommandError record whenever the stream is redirected (2>$null as much
+# as 2>&1). Under $ErrorActionPreference = "Stop" that record is promoted to a
+# terminating error, so a harmless "* daemon started *" or "error: device not
+# found" from sdb would abort the calling script. Relaxing the preference to
+# Continue for just this call keeps the redirect and $LASTEXITCODE intact and
+# lets the caller judge the result by output / exit code instead.
+#   Invoke-Native <exe> <args>               -> stdout lines, stderr dropped
+#   Invoke-Native <exe> <args> -MergeStderr  -> stdout + stderr lines as strings
+# ----------------------------------------------------------------------------
+function Invoke-Native {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string[]]$Arguments = @(),
+        [switch]$MergeStderr
+    )
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        if ($MergeStderr) {
+            & $Exe @Arguments 2>&1 | ForEach-Object { "$_" }
+        } else {
+            & $Exe @Arguments 2>$null
+        }
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+# ----------------------------------------------------------------------------
+# Device discovery via `sdb devices`.
+#   Get-ConnectedDevices <sdb>  -> array of serials in 'device' state
+#   Get-DeviceSerial <sdb>      -> first connected serial ($null if none)
+# ----------------------------------------------------------------------------
+function Get-ConnectedDevices {
+    param([string]$SdbPath)
+
+    $serials = @()
+    $output = Invoke-Native -Exe $SdbPath -Arguments @('devices')
+    foreach ($line in $output) {
+        $line = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        if ($line -like "List of devices*") { continue }
+        if ($line -match '\sdevice(\s|$)') {
+            $serials += ($line -split '\s+')[0]
+        }
+    }
+    return $serials
+}
+
+function Get-DeviceSerial {
+    param([string]$SdbPath)
+    # @() forces an array: a single returned serial would otherwise unwrap to a
+    # string, and $devices[0] would then return its first CHARACTER (e.g. "e").
+    $devices = @(Get-ConnectedDevices $SdbPath)
+    if ($devices.Count -gt 0) {
+        return $devices[0]
+    }
+    return $null
+}
+
+# ----------------------------------------------------------------------------
+# Run a one-line `sdb shell` command and return the first non-empty trimmed
+# line ("" if none). Robust against sdb returning an array of lines, which
+# would otherwise break a direct .Trim() call ([Object[]] has no Trim()).
+# Reads the caller's $Sdb (sdb path) and $Serial (target device; when empty
+# the command goes to sdb's default target) - the convention the debug scripts
+# already follow, so they can share this instead of each carrying a copy.
+# ----------------------------------------------------------------------------
+function Invoke-SdbLine {
+    param([string]$ShellCmd)
+    $target = @()
+    if ($Serial) { $target = @('-s', $Serial) }
+    $out = Invoke-Native -Exe $Sdb -Arguments ($target + @('shell', $ShellCmd))
+    foreach ($line in @($out)) {
+        $t = ("$line" -replace "`r","").Trim()
+        if ($t) { return $t }
+    }
+    return ""
+}
+
+# ----------------------------------------------------------------------------
+# Resolve the LAUNCHABLE app id for a package/app id, as the device lists it.
+#   Resolve-AppId <sdb> <serial> <needle>
+# `app_launcher -l` prints entries as 'Name'  'AppID'. Prefer an exact match,
+# then a dotted token containing the needle (a real app id is dotted; the bare
+# display-name token is not), then any containing token.
+# Returns the id, or $null when the app is not listed (not installed).
+# `launch_app`/`app_launcher -s` with an unknown id silently do nothing, so
+# callers must treat $null as an error instead of launching blind (issue #97).
+# ----------------------------------------------------------------------------
+function Resolve-AppId {
+    param([string]$SdbPath, [string]$DeviceSerial, [string]$Needle)
+    $target = @()
+    if ($DeviceSerial) { $target = @('-s', $DeviceSerial) }
+    $out = Invoke-Native -Exe $SdbPath -Arguments ($target + @('shell', 'app_launcher -l'))
+    $candidates = @()
+    foreach ($line in @($out)) {
+        foreach ($m in [regex]::Matches("$line", "'([^']*)'")) {
+            $tok = $m.Groups[1].Value
+            if ($tok -and $tok.Contains($Needle)) { $candidates += $tok }
+        }
+    }
+    if ($candidates.Count -eq 0) { return $null }
+    # An exact hit counts only when it is dotted: the display NAME can equal the
+    # needle too ('MyWebApp' next to 'xA4DHr9cFv.MyWebApp') and is not launchable.
+    if ($Needle.Contains('.') -and ($candidates -contains $Needle)) { return $Needle }
+    $dotted = @($candidates | Where-Object { $_.Contains('.') })
+    if ($dotted.Count -gt 0) { return $dotted[0] }
+    return $candidates[0]
+}
+
+# ----------------------------------------------------------------------------
+# Locate em-cli.bat (Emulator Manager CLI).
+#   Get-SdkPath honours TIZEN_SDK_PATH and ~\.tizen.sdk.path.config (the path
+#   tizen-sdk-init saves); the literal paths stay as a last resort for an SDK
+#   that is installed but has no config written yet.
+# Returns the absolute path, or $null if not found.
+# ----------------------------------------------------------------------------
+function Find-EmCli {
+    $sdkPath = Get-SdkPath
+    $candidates = @(
+        (Join-Path $sdkPath "tools\emulator\bin\em-cli.bat"),
+        (Join-Path $env:USERPROFILE "tizen-sdk\tools\emulator\bin\em-cli.bat"),
+        "C:\tizen-sdk\tools\emulator\bin\em-cli.bat"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { return $c }
+    }
+    return $null
+}
+
+# Prefetch phase: download every item (Id/Url/Destination) with up to $Jobs
+# concurrent Start-Job workers. Returns a hashtable Id -> @{ Id; Status; Error }.
+# A failed/timed-out item is simply absent from disk afterwards; the install
+# worker (Get-PackageInstallWorker) re-downloads such items itself, with retry
+# and ZIP validation, so callers may ignore the return value.
+function Invoke-ParallelDownloads {
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Items,
+        [ValidateRange(1,8)][int]$Jobs = 4,
+        [int]$TimeoutSec = 1800  # per-download cap, mirrors curl --max-time in common.sh's download_queue_parallel
+    )
+    $results = @{}
+    $total = $Items.Count
+    # Nothing to fetch (e.g. update-package with every package already current,
+    # or a resolved set made only of meta packages): return before touching jobs.
+    if ($total -eq 0) { return $results }
+    $pending = [System.Collections.Queue]::new()
+    foreach ($item in $Items) { $pending.Enqueue($item) }
+    # Keyed by Job.Id -> @{ Job; Item; Start } so a stalled download can be
+    # matched back to its package name and destination file when it times out.
+    $running = @{}
+    $completed = 0
+
+    while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+        while ($pending.Count -gt 0 -and $running.Count -lt $Jobs) {
+            $item = $pending.Dequeue()
+            $job = Start-Job -ScriptBlock {
+                param($Id, $Url, $Destination)
+                # A Start-Job worker is a fresh powershell.exe: it does not inherit
+                # the TLS 1.2 forcing the parent script applied to ServicePointManager.
+                try {
+                    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+                } catch { }
+                # Download to a .tmp sibling and rename on success so a killed
+                # (timed-out) job never leaves a truncated file at Destination.
+                $tmp = "$Destination.tmp"
+                try {
+                    $wc = New-Object System.Net.WebClient
+                    $wc.DownloadFile($Url, $tmp)
+                    $wc.Dispose()
+                    Move-Item -Force $tmp $Destination
+                    [pscustomobject]@{ Id=$Id; Status="OK" }
+                } catch {
+                    Remove-Item -Force $tmp -ErrorAction SilentlyContinue
+                    # WebClient wraps the real cause (timeout/proxy/TLS/DNS) one level
+                    # down in InnerException; its own Message is a generic
+                    # "An exception occurred during a WebClient request." otherwise.
+                    $msg = $_.Exception.Message
+                    if ($_.Exception.InnerException) { $msg = $_.Exception.InnerException.Message }
+                    [pscustomobject]@{ Id=$Id; Status="FAIL"; Error=$msg }
+                }
+            } -ArgumentList $item.Id, $item.Url, $item.Destination
+            $running[$job.Id] = [pscustomobject]@{ Job = $job; Item = $item; Start = Get-Date }
+        }
+
+        if ($running.Count -eq 0) { break }
+
+        # Short poll so we can check per-job elapsed time even when nothing
+        # has finished yet (a stalled WebClient.DownloadFile never throws on
+        # its own - there's no built-in timeout - so this loop is what notices).
+        $done = Wait-Job -Job @($running.Values.Job) -Any -Timeout 5
+        if ($done) {
+            $entry = $running[$done.Id]
+            $result = Receive-Job $done -ErrorAction SilentlyContinue
+            if (-not $result) { $result = [pscustomobject]@{ Id = $entry.Item.Id; Status = "FAIL"; Error = "No result returned" } }
+            $results["$($result.Id)"] = $result
+            Remove-Job $done -Force -ErrorAction SilentlyContinue
+            $running.Remove($done.Id)
+            $completed++
+            if ($result.Status -eq "OK") {
+                Write-Info ("[{0}/{1}] {2} downloaded" -f $completed, $total, $result.Id)
+            } else {
+                Write-Warn ("[{0}/{1}] {2} failed: {3}" -f $completed, $total, $result.Id, $result.Error)
+            }
+        }
+
+        $now = Get-Date
+        foreach ($jobId in @($running.Keys)) {
+            $entry = $running[$jobId]
+            if (($now - $entry.Start).TotalSeconds -le $TimeoutSec) { continue }
+            Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue
+            Remove-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+            Remove-Item -Force "$($entry.Item.Destination).tmp" -ErrorAction SilentlyContinue
+            $running.Remove($jobId)
+            $completed++
+            $results[$entry.Item.Id] = [pscustomobject]@{ Id = $entry.Item.Id; Status = "FAIL"; Error = "Timed out after ${TimeoutSec}s" }
+            Write-Warn ("[{0}/{1}] {2} timed out after {3}s, dropped" -f $completed, $total, $entry.Item.Id, $TimeoutSec)
+        }
+    }
+    return $results
+}
+
+# ----------------------------------------------------------------------------
+# Parallel package install: download-if-missing + extract + merge + manifest
+#
+# Shared by tizen-sdk-install, tizen-platform-install, tizen-tv-sdk-install,
+# tizen-download-emulator-package, tizen-download-mobile-platform (MOBILE and
+# IOT-Headed flows) and tizen-update-package. Each caller builds "work items"
+# after its own skip logic (resume / same-version / meta package), turns them
+# into download items for Invoke-ParallelDownloads, then hands the same items
+# to Invoke-ParallelPackageInstall.
+#
+# Work item (pscustomobject) fields:
+#   Pkg      package name (manifest is written as <Pkg>.manifest)
+#   Idx      1-based position in the caller's resolved list (progress label)
+#   Url      download URL
+#   Zip      local zip path under the caller's workdir
+#   Stage    per-package extraction dir under the caller's workdir
+#   Version  optional; when set and the zip carries no pkginfo.manifest, a
+#            minimal manifest with this version is written (update-package)
+#   Label    optional; replaces the default "installed" in the OK log line
+# ----------------------------------------------------------------------------
+
+function ConvertTo-DownloadItems {
+    param([Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$WorkItems)
+    return @($WorkItems | ForEach-Object {
+        [pscustomobject]@{ Id = $_.Pkg; Url = $_.Url; Destination = $_.Zip }
+    })
+}
+
+# The Start-Job worker for ONE package. It runs in a separate powershell.exe
+# with none of this file's functions or the parent's variables, so everything
+# it needs (zip extractor, 404 fallback) is defined inline and every input is a
+# flat scalar/array argument (nested objects would be flattened by the job
+# argument serializer).
+#
+# Returns one [pscustomobject]@{ Pkg; Idx; Status = OK|SKIP|FAIL; Reason }.
+function Get-PackageInstallWorker {
+    return {
+        param($Pkg, $Idx, $Url, $Zip, $Stage, $Version, $PkgInfoDir, $DestPath, $PkgOs, $MergeMutexName, $PkgRepo, $BinListCache, $OptionalPattern)
+
+        # Fresh process: neither System.IO.Compression.ZipFile nor the parent's
+        # TLS 1.2 ServicePointManager setting is present by default.
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        try {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+        } catch { }
+
+        function New-Result {
+            param([string]$Status, [string]$Reason)
+            return [pscustomobject]@{ Pkg = $Pkg; Idx = $Idx; Status = $Status; Reason = $Reason }
+        }
+
+        # Entry-by-entry with overwrite: Tizen rootstrap (RS) ZIPs contain
+        # case-only-distinct paths (ipt_ttl.h AND ipt_TTL.h) that make the
+        # whole-archive extractor abort on case-insensitive NTFS; letting the last
+        # of a colliding pair win keeps the package installable. Wrapped in a
+        # function so its local $destPath cannot clobber the $DestPath parameter
+        # (PowerShell variable names are case-insensitive).
+        function Expand-ZipEntryByEntryLocal {
+            param([string]$ZipPath, [string]$Destination)
+            $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+            try {
+                foreach ($entry in $archive.Entries) {
+                    if ([string]::IsNullOrEmpty($entry.Name)) { continue }
+                    $destPath = Join-Path $Destination $entry.FullName
+                    $destDir  = Split-Path -Parent $destPath
+                    if ($destDir -and -not (Test-Path $destDir)) {
+                        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+                    }
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destPath, $true)
+                }
+            } finally {
+                $archive.Dispose()
+            }
+        }
+
+        # Newest published <pkg>_<ver>_<os>.zip from the repo's binary/ listing,
+        # for the pkg_list-ahead-of-binary (404) fallback. Only used when the
+        # caller passed $PkgRepo (tizen-sdk-install).
+        function Get-PublishedBinaryLocal {
+            param([string]$PkgName, [string]$Os, [string[]]$Cache)
+            if (-not $Cache) { return $null }
+            $esc = [regex]::Escape($PkgName)
+            $osc = [regex]::Escape($Os)
+            $pattern = "^${esc}_[^_/]+_${osc}\.zip$"
+            $cands = @($Cache | Where-Object { $_ -match $pattern })
+            if ($cands.Count -eq 0) { return $null }
+            return ($cands | Sort-Object {
+                $v = ($_ -replace "^${esc}_", '') -replace "_${osc}\.zip$", ''
+                try { [version]$v } catch { [version]'0.0.0' }
+            } | Select-Object -Last 1)
+        }
+
+        $isOptional = ($OptionalPattern -and $Pkg -imatch $OptionalPattern)
+
+        # --- Download if the prefetch phase did not leave a zip behind -----------
+        # .tmp+rename keeps a killed download from leaving a truncated $Zip that a
+        # later run would trust; the ZIP validation catches CDN/proxy responses
+        # that are 200 but not an archive. Every failure path inside the loop
+        # either retries or returns, so the loop only exits via the final break.
+        if (-not (Test-Path $Zip)) {
+            $maxRetries = 3
+            $tmpZip = "$Zip.tmp"
+            for ($attempt = 1; $attempt -le $maxRetries; $attempt++) {
+                $downloadUrl = $Url
+                try {
+                    $wc = New-Object System.Net.WebClient
+                    $wc.DownloadFile($downloadUrl, $tmpZip)
+                    $wc.Dispose()
+                } catch {
+                    Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+                    $alt = $null
+                    $listingOk = $false
+                    if ($PkgRepo) {
+                        $listingOk = ($null -ne $BinListCache -and @($BinListCache).Count -gt 0)
+                        $alt = Get-PublishedBinaryLocal -PkgName $Pkg -Os $PkgOs -Cache $BinListCache
+                    }
+                    if ($alt -and $alt -ne [System.IO.Path]::GetFileName($Zip)) {
+                        # pkg_list version ran ahead of the published binaries:
+                        # fall back to the newest build that actually exists.
+                        $downloadUrl = "$PkgRepo/binary/$alt"
+                        try {
+                            $wc = New-Object System.Net.WebClient
+                            $wc.DownloadFile($downloadUrl, $tmpZip)
+                            $wc.Dispose()
+                        } catch {
+                            Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+                            if ($attempt -lt $maxRetries) { Start-Sleep -Seconds (2 * $attempt); continue }
+                            return New-Result "FAIL" "Download failed (after $maxRetries attempts): $downloadUrl - $_"
+                        }
+                    } elseif ($listingOk -and -not $alt) {
+                        # No build of this package is published at all - retrying
+                        # cannot help (upstream gap). Skip instead of failing the run.
+                        return New-Result "SKIP" "not published in the repo (upstream gap), skipped"
+                    } else {
+                        if ($attempt -lt $maxRetries) { Start-Sleep -Seconds (2 * $attempt); continue }
+                        return New-Result "FAIL" "Download failed (after $maxRetries attempts): $Url - $_"
+                    }
+                }
+                try {
+                    $validateArchive = [System.IO.Compression.ZipFile]::OpenRead($tmpZip)
+                    $validateArchive.Dispose()
+                } catch {
+                    Remove-Item -Force $tmpZip -ErrorAction SilentlyContinue
+                    if ($attempt -lt $maxRetries) { Start-Sleep -Seconds (2 * $attempt); continue }
+                    return New-Result "FAIL" "Downloaded file is not a valid ZIP (after $maxRetries attempts): $downloadUrl - $_"
+                }
+                Move-Item -Force $tmpZip $Zip
+                break
+            }
+        }
+
+        # --- Extract ------------------------------------------------------------
+        if (Test-Path $Stage) {
+            Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+            Start-Sleep -Milliseconds 500
+        }
+        New-Item -ItemType Directory -Path $Stage -Force | Out-Null
+
+        try {
+            Expand-ZipEntryByEntryLocal -ZipPath $Zip -Destination $Stage
+        } catch {
+            Remove-Item -Force $Zip -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+            if ($isOptional) {
+                return New-Result "SKIP" "optional rootstrap (RS), extraction failed: $_"
+            }
+            return New-Result "FAIL" "Extraction failed: $_"
+        }
+
+        # --- Merge data\ into the SDK root ----------------------------------------
+        # Serialized across workers via a named mutex: several robocopy processes
+        # writing into the SAME destination tree at once transiently fail on
+        # shared parent directories (exit 8/11/16). Download and extraction stay
+        # parallel; only this copy is one-at-a-time.
+        $reason = $null
+        $dataDir = Join-Path $Stage "data"
+        if (Test-Path $dataDir) {
+            $dataItems = Get-ChildItem -Path $dataDir -Force -ErrorAction SilentlyContinue
+            if (@($dataItems).Count -gt 0) {
+                # windows-64 AND windows-32 (a custom -RepoUrl may only serve the
+                # 32-bit pkg_list): robocopy is the long-path-safe fast path on
+                # Windows; PowerShell Core on Linux/macOS falls back to Copy-Item.
+                if ($PkgOs -like "windows-*") {
+                    $mergeMutex = New-Object System.Threading.Mutex($false, $MergeMutexName)
+                    $robocopyExit = 0
+                    $mergeLogFile = Join-Path $Stage "robocopy_merge.log"
+                    try {
+                        try {
+                            $mergeMutex.WaitOne() | Out-Null
+                        } catch [System.Threading.AbandonedMutexException] {
+                            # A previous holder was killed (per-package timeout in the
+                            # driver) while merging. The mutex IS acquired by us at this
+                            # point; the destination tree is still consistent enough for
+                            # robocopy's idempotent /XO merge, so carry on.
+                        }
+                        # /R:5 /W:2 retries transient file locks (antivirus, I/O
+                        # contention); the outer loop retries whole-run failures.
+                        # /XO skips older files (idempotent re-merge), /FFT uses 2s
+                        # FAT timestamp granularity to avoid spurious mismatches.
+                        for ($mergeAttempt = 1; $mergeAttempt -le 3; $mergeAttempt++) {
+                            robocopy $dataDir $DestPath /E /NFL /NDL /NJH /NJS /NP /R:5 /W:2 /XO /FFT /LOG:$mergeLogFile | Out-Null
+                            $robocopyExit = $LASTEXITCODE
+                            if ($robocopyExit -lt 8) { break }
+                            if ($mergeAttempt -lt 3) { Start-Sleep -Seconds (3 * $mergeAttempt) }
+                        }
+                    } finally {
+                        try { $mergeMutex.ReleaseMutex() } catch { }
+                        $mergeMutex.Dispose()
+                    }
+                    if ($robocopyExit -ge 8) {
+                        $mergeDetail = ""
+                        if (Test-Path $mergeLogFile) {
+                            $mergeDetail = (@(Get-Content $mergeLogFile -ErrorAction SilentlyContinue | Select-Object -Last 5) -join " | ")
+                        }
+                        Remove-Item -Force $Zip -ErrorAction SilentlyContinue
+                        Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+                        return New-Result "FAIL" "Merge failed (robocopy $robocopyExit after 3 attempts): $mergeDetail"
+                    }
+                } else {
+                    Copy-Item -Path "$dataDir/*" -Destination $DestPath -Recurse -Force
+                }
+            } else {
+                $reason = "data\ is empty, skip merge"
+            }
+        }
+
+        # --- Manifest record ------------------------------------------------------
+        $manifest = Join-Path $Stage "pkginfo.manifest"
+        $manifestDest = Join-Path $PkgInfoDir "$Pkg.manifest"
+        if (Test-Path $manifest) {
+            Copy-Item -Path $manifest -Destination $manifestDest -Force
+        } elseif ($Version) {
+            # No pkginfo.manifest in the zip: record the pkg_list version so the
+            # next update-package run can compare against it.
+            Set-Content -Path $manifestDest -Value "Package : $Pkg`nVersion : $Version`nOS : $PkgOs`n" -Encoding UTF8
+        }
+
+        Remove-Item -Force $Zip -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
+        return New-Result "OK" $reason
+    }
+}
+
+# Runs Get-PackageInstallWorker for every work item with a bounded number of
+# concurrent Start-Job workers, logs each outcome as it arrives and returns
+#   [pscustomobject]@{ Ok; Skip; Fail; Skipped = @("<pkg> - <reason>", ...) }
+#
+# Extraction is disk-I/O bound while downloads are latency bound, so -Jobs
+# defaults to 3 independently of -DownloadJobs (the value every installer used
+# before this driver was shared; it is not exposed through the CLIs).
+function Invoke-ParallelPackageInstall {
+    param(
+        [Parameter(Mandatory=$true)][AllowEmptyCollection()][object[]]$Items,
+        [ValidateRange(1,8)][int]$Jobs = 3,
+        [Parameter(Mandatory=$true)][string]$PkgInfoDir,
+        [Parameter(Mandatory=$true)][string]$DestPath,
+        [Parameter(Mandatory=$true)][string]$PkgOs,
+        [int]$Total = 0,                 # denominator for "[i/N]" labels; defaults to Items.Count
+        [string]$LabelPrefix = "",       # e.g. "IOT " -> "[IOT 3/12]"
+        [string]$PkgRepo = "",           # enables the binary/ 404 fallback (tizen-sdk-install)
+        [string[]]$BinListCache = @(),   # pre-fetched binary/ listing for that fallback
+        [string]$OptionalPattern = "",   # packages matching this are SKIP (not FAIL) on extraction error
+        [int]$TimeoutSec = 1800          # per-package cap on download+extract+merge combined
+    )
+    $summary = [pscustomobject]@{ Ok = 0; Skip = 0; Fail = 0; Skipped = @() }
+    if ($Items.Count -eq 0) { return $summary }
+    if ($Total -le 0) { $Total = $Items.Count }
+
+    $jobs = $Jobs
+    Write-Info "Extracting $($Items.Count) packages ($jobs parallel)..."
+
+    $worker = Get-PackageInstallWorker
+    # One mutex name per call, shared by every worker job to serialize the
+    # robocopy merge (see the worker).
+    $mergeMutexName = "TizenSdkMerge_" + [guid]::NewGuid().ToString("N")
+
+    $pending = [System.Collections.Queue]::new()
+    foreach ($item in $Items) { $pending.Enqueue($item) }
+    $running = @{}
+
+    while ($pending.Count -gt 0 -or $running.Count -gt 0) {
+        while ($pending.Count -gt 0 -and $running.Count -lt $jobs) {
+            $item = $pending.Dequeue()
+            $version = if ($item.PSObject.Properties['Version']) { $item.Version } else { $null }
+            $job = Start-Job -ScriptBlock $worker -ArgumentList `
+                $item.Pkg, $item.Idx, $item.Url, $item.Zip, $item.Stage, $version, $PkgInfoDir, $DestPath, $PkgOs, $mergeMutexName, $PkgRepo, $BinListCache, $OptionalPattern
+            $running[$job.Id] = [pscustomobject]@{ Job = $job; Item = $item; Start = Get-Date }
+        }
+
+        if ($running.Count -eq 0) { break }
+
+        # Short poll so per-job elapsed time is checked even while nothing finishes.
+        $done = Wait-Job -Job @($running.Values.Job) -Any -Timeout 5
+        if ($done) {
+            $entry = $running[$done.Id]
+            $item = $entry.Item
+            $result = Receive-Job $done -ErrorAction SilentlyContinue
+            if (-not $result) { $result = [pscustomobject]@{ Pkg = $item.Pkg; Idx = $item.Idx; Status = "FAIL"; Reason = "Extraction worker produced no result" } }
+            Remove-Job $done -Force -ErrorAction SilentlyContinue
+            $running.Remove($done.Id)
+
+            $tag = "[{0}{1}/{2}]" -f $LabelPrefix, $result.Idx, $Total
+            switch ($result.Status) {
+                "OK" {
+                    $summary.Ok++
+                    if ($result.Reason) { Write-Info "$tag $($result.Pkg): $($result.Reason)" }
+                    $label = if ($item.PSObject.Properties['Label'] -and $item.Label) { $item.Label } else { "installed" }
+                    Write-Success "$tag $($result.Pkg) $label"
+                }
+                "SKIP" {
+                    $summary.Skip++
+                    $summary.Skipped += "$($result.Pkg) - $($result.Reason)"
+                    Write-Warn "$tag $($result.Pkg): $($result.Reason)"
+                }
+                default {
+                    $summary.Fail++
+                    Write-Err "$tag $($result.Pkg): $($result.Reason)"
+                }
+            }
+        }
+
+        $now = Get-Date
+        foreach ($jobId in @($running.Keys)) {
+            $entry = $running[$jobId]
+            if (($now - $entry.Start).TotalSeconds -le $TimeoutSec) { continue }
+            Stop-Job -Job $entry.Job -ErrorAction SilentlyContinue
+            Remove-Job -Job $entry.Job -Force -ErrorAction SilentlyContinue
+            Remove-Item -Force $entry.Item.Zip -ErrorAction SilentlyContinue
+            Remove-Item -Recurse -Force $entry.Item.Stage -ErrorAction SilentlyContinue
+            $running.Remove($jobId)
+            $summary.Fail++
+            Write-Warn ("[{0}{1}/{2}] {3} timed out during extraction/merge after {4}s, dropped" -f $LabelPrefix, $entry.Item.Idx, $Total, $entry.Item.Pkg, $TimeoutSec)
+        }
+    }
+    return $summary
+}
