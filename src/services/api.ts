@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ApiError, ConnectOutcome, Outcome, PackageReport, ScanData, Settings, ToolchainStatus } from "../types";
+import type { ApiError, CertificateProfile, ConnectOutcome, InstalledPackage, Outcome, PackageReport, ScanData, Settings, ToolchainStatus } from "../types";
 
 /** Typed bridge to the Rust backend. The frontend has no other way to touch the system. */
 export function toApiError(e: unknown): ApiError {
@@ -11,6 +11,13 @@ export const api = {
   toolchainStatus: () => invoke<ToolchainStatus>("toolchain_status"),
   findExistingSdk: () => invoke<string[]>("find_existing_sdk"),
   setSdkPath: (path: string) => invoke<void>("set_sdk_path", { path }),
+  installSamsungSdk: () => invoke<string>("install_samsung_sdk"),
+  createSamsungCertificate: (v: { ip: string; port: number; duid: string; profileName: string; identity: string; password: string }) =>
+    invoke<CertificateProfile>("create_samsung_certificate", v),
+  removeSamsungCertificateProfile: (profileName: string) =>
+    invoke<void>("remove_samsung_certificate_profile", { profileName }),
+  installPackage: (v: { packagePath: string; profileName: string; ip: string; port: number; duid: string; runAfterInstall: boolean }) =>
+    invoke<InstalledPackage>("install_package", v),
   scanTvs: (opId: string, subnet?: string) => invoke<Outcome<ScanData>>("scan_tvs", { opId, subnet: subnet ?? null }),
   connectTv: (ip: string, port: number | null, opId: string) => invoke<ConnectOutcome>("connect_tv", { ip, port, opId }),
   disconnectTv: (ip: string, port: number) => invoke<boolean>("disconnect_tv", { ip, port }),
