@@ -18,4 +18,5 @@ tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+fs2 = "0.4"
 tvdeploy-core = { path = "../crates/tvdeploy-core" }
