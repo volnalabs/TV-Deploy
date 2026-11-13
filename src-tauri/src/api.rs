@@ -1,19 +1,21 @@
 //! Tauri commands. Every argument is validated here (and again inside `tvdeploy-core`) before
 //! anything is executed.
 
-use crate::settings::{self, SavedDevice, Settings};
+use crate::settings::{self, SavedCertificateProfile, SavedDevice, Settings};
 use crate::toolchain::{self, NodeSource};
 use crate::AppState;
 use serde::Serialize;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, State};
 use tvdeploy_core::connectivity::{local_ip_towards, probe_tcp, Probe, MIN_DIAGNOSTIC_TIMEOUT};
 use tvdeploy_core::diagnostics::{self, Diagnosis};
 use tvdeploy_core::package::{analyze_wgt, PackageError, PackageReport};
 use tvdeploy_core::samsung::commands::Invocation;
 use tvdeploy_core::samsung::results::{connect_result, duid_result};
-use tvdeploy_core::samsung::runner::{run, CancelToken, RunError, RunOptions, RunOutput};
+use tvdeploy_core::samsung::runner::{run, run_with_env, CancelToken, RunError, RunOptions, RunOutput};
 use tvdeploy_core::validate::{self, parse_port, parse_tv_ip};
 
 #[derive(Debug, Serialize)]
@@ -77,6 +79,7 @@ pub struct ToolchainStatus {
     cli_ready: bool,
     sdk_path: Option<String>,
     sdk_ready: bool,
+    tv_extension_ready: bool,
     /// Approximate free space the Samsung installer demands before installing a fresh SDK
     /// (reported by the Samsung CLI itself: 15 GB). Shown to users before any SDK download.
     sdk_required_gb: u32,
@@ -94,6 +97,7 @@ pub fn toolchain_status(app: AppHandle, state: State<'_, AppState>) -> Toolchain
         node: l.node_source,
         cli_ready: l.cli_dir.is_some(),
         sdk_path: sdk,
+        tv_extension_ready: sdk.as_deref().map(|p| toolchain::tv_sdk_is_usable(std::path::Path::new(p))).unwrap_or(false),
         sdk_ready,
         sdk_required_gb: 15,
     }
@@ -140,6 +144,381 @@ pub async fn set_sdk_path(
     let mut s = state.settings.lock().unwrap();
     s.sdk_path = Some(path);
     settings::save(&state.data_dir, &s).map_err(|_| ApiError::new("io_error"))
+}
+
+/// Install the official Tizen SDK baseline and Samsung TV Extension. The actual
+/// PowerShell/Bash installers are pinned Samsung upstream scripts; TV Deploy only
+/// orchestrates them and never downloads or installs a user application.
+#[tauri::command]
+pub async fn install_samsung_sdk(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> ApiResult<String> {
+    let requested = state.settings.lock().unwrap().sdk_path.clone();
+    let app_for_install = app.clone();
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        crate::sdk_installer::install(&app_for_install, requested.as_deref())
+    })
+    .await
+    .map_err(|_| ApiError::new("internal"))?
+    .map_err(|detail| ApiError { code: "sdk_install_failed".into(), detail: Some(detail) })?;
+
+    let path_string = path.to_string_lossy().into_owned();
+    validate::check_cli_path(&path_string)?;
+    let tc = toolchain::build(&app, &state.data_dir, Some(&path_string)).map_err(ApiError::new)?;
+    let inv = Invocation::sdk_init(&path_string)?;
+    let init = tauri::async_runtime::spawn_blocking(move || {
+        run(
+            &tc,
+            &inv,
+            &RunOptions {
+                timeout: Duration::from_secs(60),
+                cancel: CancelToken::new(),
+            },
+        )
+    })
+    .await
+    .map_err(|_| ApiError::new("internal"))?;
+    let init_ok = matches!(&init, Ok(o) if o.exit_code == Some(0) && o.envelope.as_ref().map(|e| e.is_success()).unwrap_or(false));
+    if !init_ok {
+        return Err(ApiError {
+            code: "sdk_init_failed".into(),
+            detail: Some(init.err().map(|e| e.to_string()).unwrap_or_else(|| {
+                init.ok().map(|o| o.stderr).unwrap_or_default()
+            })),
+        });
+    }
+
+    let mut settings = state.settings.lock().unwrap();
+    settings.sdk_path = Some(path_string.clone());
+    settings::save(&state.data_dir, &settings).map_err(|_| ApiError::new("io_error"))?;
+    Ok(path_string)
+}
+
+#[derive(Serialize)]
+pub struct CertificateProfileInfo {
+    name: String,
+    identity: String,
+    duid: String,
+}
+
+fn sdk_data_dir(sdk: &Path) -> PathBuf {
+    let info = fs::read_to_string(sdk.join("sdk.info")).unwrap_or_default();
+    if let Some(value) = info.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        (key.trim() == "TIZEN_SDK_DATA_PATH").then(|| value.trim().trim_matches('"').to_string())
+    }) {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return path;
+        }
+    }
+    let name = sdk.file_name().and_then(|s| s.to_str()).unwrap_or("tizen-sdk");
+    sdk.parent().unwrap_or(sdk).join(format!("{name}-data"))
+}
+
+fn cli_success(output: &RunOutput, code: &str) -> ApiResult<()> {
+    if output.exit_code == Some(0)
+        && output.envelope.as_ref().map(|e| e.is_success()).unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let detail = output
+        .envelope
+        .as_ref()
+        .map(|e| diagnostics::technical_detail(e, None))
+        .unwrap_or_else(|| diagnostics::redact(&output.stderr.chars().take(2500).collect::<String>()));
+    Err(ApiError {
+        code: code.into(),
+        detail: if detail.is_empty() { None } else { Some(detail) },
+    })
+}
+
+fn validate_cert_password(password: &str) -> ApiResult<()> {
+    if password.len() < 8
+        || !password.bytes().any(|c| c.is_ascii_uppercase())
+        || !password.bytes().any(|c| c.is_ascii_lowercase())
+        || !password.bytes().any(|c| c.is_ascii_digit())
+    {
+        return Err(ApiError {
+            code: "cert_password_invalid".into(),
+            detail: Some("Use at least 8 characters with uppercase, lowercase and a number.".into()),
+        });
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn create_samsung_certificate(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ip: String,
+    port: u32,
+    duid: String,
+    profile_name: String,
+    identity: String,
+    password: String,
+) -> ApiResult<CertificateProfileInfo> {
+    let ip = parse_tv_ip(&ip)?;
+    let port = parse_port(port)?;
+    validate_cert_password(&password)?;
+    if duid.trim().is_empty() || duid.len() > 256 {
+        return Err(ApiError::new("invalid_duid"));
+    }
+    if !duid.bytes().all(|b| b.is_ascii_alphanumeric() || b"#.-:_".contains(&b)) {
+        return Err(ApiError::new("invalid_duid"));
+    }
+    let (sdk_path, existing_profile, device_matches) = {
+        let settings = state.settings.lock().unwrap();
+        let device_matches = settings.devices.iter().any(|d| {
+            d.ip == ip.to_string() && d.port == port && d.duid.as_deref() == Some(duid.as_str())
+        });
+        (
+            settings.sdk_path.clone(),
+            settings.certificate_profiles.iter().find(|p| p.name == profile_name).cloned(),
+            device_matches,
+        )
+    };
+    if !device_matches {
+        return Err(ApiError {
+            code: "duid_not_verified".into(),
+            detail: Some("Reconnect to this TV in TV Deploy so its DUID is verified before issuing a certificate.".into()),
+        });
+    }
+    if let Some(saved) = existing_profile {
+        if saved.duid != duid {
+            return Err(ApiError {
+                code: "profile_duid_mismatch".into(),
+                detail: Some("This profile is already associated with another TV. Choose a new profile name for this television.".into()),
+            });
+        }
+        return Ok(CertificateProfileInfo { name: saved.name, identity: saved.identity, duid: saved.duid });
+    }
+    let sdk = sdk_path.ok_or_else(|| ApiError::new("sdk_not_set"))?;
+    if !toolchain::tv_sdk_is_usable(Path::new(&sdk)) {
+        return Err(ApiError::new("tv_extension_missing"));
+    }
+    let tc = toolchain::build(&app, &state.data_dir, Some(&sdk)).map_err(ApiError::new)?;
+    let author = Invocation::generate_samsung_author(&profile_name, &identity)?;
+    let distributor = Invocation::generate_samsung_distributor(&profile_name, &duid)?;
+    let create_profile = Invocation::create_samsung_profile(&profile_name)?;
+    let password_env = vec![("TIZEN_CERTIFICATE_PASSWORD".to_string(), password)];
+
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let data_dir = sdk_data_dir(&tc.sdk_path);
+        let profile_dir = data_dir.join("keystore").join("samsung").join(&profile_name);
+        let author_p12 = profile_dir.join("author.p12");
+        let distributor_p12 = profile_dir.join("distributor.p12");
+
+        if author_p12.exists() && !distributor_p12.exists() {
+            // Resume a partially completed certificate flow instead of attempting to
+            // overwrite an existing Samsung author certificate.
+        } else if author_p12.exists() && distributor_p12.exists() {
+            // A complete pair without a settings entry may be left by a prior interrupted
+            // profile-registration step; try to register the profile below.
+        } else {
+            let author_out = run_with_env(
+                &tc,
+                &author,
+                &RunOptions { timeout: Duration::from_secs(7 * 60), cancel: CancelToken::new() },
+                &password_env,
+            ).map_err(|e| ApiError { code: "certificate_failed".into(), detail: Some(e.to_string()) })?;
+            cli_success(&author_out, "certificate_failed")?;
+        }
+
+        if !distributor_p12.exists() {
+            let distributor_out = run_with_env(
+                &tc,
+                &distributor,
+                &RunOptions { timeout: Duration::from_secs(7 * 60), cancel: CancelToken::new() },
+                &password_env,
+            ).map_err(|e| ApiError { code: "certificate_failed".into(), detail: Some(e.to_string()) })?;
+            cli_success(&distributor_out, "certificate_failed")?;
+        } else {
+            let csr = fs::read_to_string(profile_dir.join("distributor.csr")).unwrap_or_default();
+            if !csr.contains(&format!("URN:tizen:deviceid={duid}")) {
+                return Err(ApiError {
+                    code: "profile_duid_mismatch".into(),
+                    detail: Some("A distributor certificate with this profile name already exists for a different TV. Choose another profile name.".into()),
+                });
+            }
+        }
+
+        let profile_out = run(
+            &tc,
+            &create_profile,
+            &RunOptions { timeout: Duration::from_secs(90), cancel: CancelToken::new() },
+        ).map_err(|e| ApiError { code: "certificate_failed".into(), detail: Some(e.to_string()) })?;
+        cli_success(&profile_out, "certificate_failed")?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| ApiError::new("internal"))?;
+    result?;
+
+    let profile = SavedCertificateProfile {
+        name: profile_name,
+        identity,
+        duid: duid.clone(),
+    };
+    let mut settings = state.settings.lock().unwrap();
+    settings.certificate_profiles.retain(|p| p.name != profile.name);
+    settings.certificate_profiles.push(profile.clone());
+    settings::save(&state.data_dir, &settings).map_err(|_| ApiError::new("io_error"))?;
+    Ok(CertificateProfileInfo { name: profile.name, identity: profile.identity, duid: profile.duid })
+}
+
+#[tauri::command]
+pub async fn remove_samsung_certificate_profile(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    profile_name: String,
+) -> ApiResult<()> {
+    let sdk = state.settings.lock().unwrap().sdk_path.clone().ok_or_else(|| ApiError::new("sdk_not_set"))?;
+    let tc = toolchain::build(&app, &state.data_dir, Some(&sdk)).map_err(ApiError::new)?;
+    let invocation = Invocation::remove_samsung_profile(&profile_name)?;
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        run(&tc, &invocation, &RunOptions { timeout: Duration::from_secs(60), cancel: CancelToken::new() })
+    })
+    .await
+    .map_err(|_| ApiError::new("internal"))?
+    .map_err(|e| ApiError { code: "certificate_failed".into(), detail: Some(e.to_string()) })?;
+    cli_success(&out, "certificate_failed")?;
+    let mut settings = state.settings.lock().unwrap();
+    settings.certificate_profiles.retain(|p| p.name != profile_name);
+    settings::save(&state.data_dir, &settings).map_err(|_| ApiError::new("io_error"))
+}
+
+#[derive(Serialize)]
+pub struct InstallResult {
+    app_name: Option<String>,
+    app_id: Option<String>,
+    version: Option<String>,
+    signed_package_path: String,
+    tv_ip: String,
+}
+
+#[tauri::command]
+pub async fn install_package(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    package_path: String,
+    profile_name: String,
+    ip: String,
+    port: u32,
+    duid: String,
+    run_after_install: bool,
+) -> ApiResult<InstallResult> {
+    validate::check_cli_path(&package_path)?;
+    let ip = parse_tv_ip(&ip)?;
+    let port = parse_port(port)?;
+    if duid.trim().is_empty() {
+        return Err(ApiError::new("invalid_duid"));
+    }
+    let report = tauri::async_runtime::spawn_blocking({
+        let path = PathBuf::from(&package_path);
+        move || analyze_wgt(&path)
+    })
+    .await
+    .map_err(|_| ApiError::new("internal"))?
+    .map_err(|e| ApiError { code: "package_invalid".into(), detail: Some(e.to_string()) })?;
+
+    let (sdk, profile) = {
+        let settings = state.settings.lock().unwrap();
+        let device_matches = settings.devices.iter().any(|d| {
+            d.ip == ip.to_string() && d.port == port && d.duid.as_deref() == Some(duid.as_str())
+        });
+        if !device_matches {
+            return Err(ApiError::new("duid_not_verified"));
+        }
+        let profile = settings.certificate_profiles.iter().find(|p| p.name == profile_name).cloned()
+            .ok_or_else(|| ApiError::new("certificate_profile_missing"))?;
+        if profile.duid != duid {
+            return Err(ApiError::new("profile_duid_mismatch"));
+        }
+        (settings.sdk_path.clone().ok_or_else(|| ApiError::new("sdk_not_set"))?, profile)
+    };
+    if !toolchain::tv_sdk_is_usable(Path::new(&sdk)) {
+        return Err(ApiError::new("tv_extension_missing"));
+    }
+    let tc = toolchain::build(&app, &state.data_dir, Some(&sdk)).map_err(ApiError::new)?;
+    let data_dir = state.data_dir.clone();
+    let package_path = PathBuf::from(package_path);
+    let serial = format!("{}:{}", ip, port);
+    let app_name = report.app_name.clone();
+    let app_id = report.app_id.clone();
+    let version = report.version.clone();
+
+    let install_result = tauri::async_runtime::spawn_blocking(move || {
+        let staging = data_dir.join("signed-packages");
+        fs::create_dir_all(&staging).map_err(|_| ApiError::new("io_error"))?;
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let staged = staging.join(format!("tvdeploy-{timestamp}.wgt"));
+        fs::copy(&package_path, &staged).map_err(|_| ApiError::new("package_copy_failed"))?;
+
+        let tz = tc.sdk_path.join("tools").join("tizen-core").join(if cfg!(windows) { "tz.exe" } else { "tz" });
+        let mut signer = Command::new(&tz);
+        signer.args(["pack", "-b"])
+            .arg(&staged)
+            .args(["-t", "wgt", "-s"])
+            .arg(&profile.name)
+            .env("HOME", &tc.home_dir)
+            .env("USERPROFILE", &tc.home_dir)
+            .env_remove("TIZEN_SDK_PATH")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            signer.creation_flags(0x0800_0000);
+        }
+        let signed = signer.output().map_err(|e| ApiError {
+            code: "sign_failed".into(),
+            detail: Some(format!("Could not start Tizen signer: {}", e.kind())),
+        })?;
+        if !signed.status.success() {
+            let mut detail = String::from_utf8_lossy(&signed.stderr).to_string();
+            if detail.is_empty() { detail = String::from_utf8_lossy(&signed.stdout).to_string(); }
+            return Err(ApiError { code: "sign_failed".into(), detail: Some(diagnostics::redact(&detail.chars().take(2500).collect::<String>())) });
+        }
+
+        // tz pack -b re-signs an existing package in place. Do not trust its exit code alone:
+        // check that both Samsung signature documents are present and structurally valid.
+        let signed_report = analyze_wgt(&staged).map_err(|e| ApiError {
+            code: "sign_failed".into(),
+            detail: Some(format!("The signed WGT could not be inspected: {e}")),
+        })?;
+        if signed_report.signature != tvdeploy_core::package::SignatureState::SignedStructure {
+            return Err(ApiError {
+                code: "sign_failed".into(),
+                detail: Some("The Tizen signer returned success, but the WGT does not contain both Samsung signature files. Installation was stopped.".into()),
+            });
+        }
+
+        let install_invocation = Invocation::install_package(
+            staged.to_str().ok_or_else(|| ApiError::new("invalid_path"))?,
+            &serial,
+            run_after_install,
+        ).map_err(ApiError::from)?;
+        let out = run(
+            &tc,
+            &install_invocation,
+            &RunOptions { timeout: Duration::from_secs(5 * 60), cancel: CancelToken::new() },
+        ).map_err(|e| ApiError { code: "install_failed".into(), detail: Some(e.to_string()) })?;
+        cli_success(&out, "install_failed")?;
+
+        Ok(staged.to_string_lossy().into_owned())
+    })
+    .await
+    .map_err(|_| ApiError::new("internal"))??;
+
+    Ok(InstallResult {
+        app_name,
+        app_id,
+        version,
+        signed_package_path: install_result,
+        tv_ip: ip.to_string(),
+    })
 }
 
 // ---------- devices ----------
