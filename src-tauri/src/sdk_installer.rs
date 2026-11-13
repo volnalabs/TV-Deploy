@@ -3,9 +3,11 @@
 //! declared in resources/samsung-cli/PINNED.json. No SDK packages are mirrored by TV Deploy.
 
 use fs2::available_space;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 const REQUIRED_FREE_BYTES: u64 = 15 * 1024 * 1024 * 1024;
@@ -51,28 +53,74 @@ fn sdk_root(path: Option<&str>) -> Result<PathBuf, String> {
     Ok(root)
 }
 
-fn run_checked(mut command: Command, step: &str, timeout: Duration) -> Result<Output, String> {
+fn run_checked(mut command: Command, step: &str, timeout: Duration) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
 
-    let output = command
-        .output()
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
         .map_err(|e| format!("{step}: could not start installer ({})", e.kind()))?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stderr = child.stderr.take().expect("stderr piped");
+    let out_reader = thread::spawn(move || read_capped(stdout));
+    let err_reader = thread::spawn(move || read_capped(stderr));
+    let start = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out_reader.join();
+                let _ = err_reader.join();
+                return Err(format!("{step}: failed while waiting for installer ({})", error.kind()));
+            }
+        }
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out_reader.join();
+            let _ = err_reader.join();
+            return Err(format!("{step}: installer exceeded the {} minute time limit. You can retry; Samsung's installer keeps its resume markers.", timeout.as_secs() / 60));
+        }
+        thread::sleep(Duration::from_millis(250));
+    };
+
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
+    if !status.success() {
         let detail = tail_text(&format!("{stdout}\n{stderr}"), 3000);
         return Err(format!(
             "{step} failed with exit code {:?}. {}",
-            output.status.code(),
+            status.code(),
             if detail.is_empty() { "No diagnostic output was returned.".into() } else { detail }
         ));
     }
-    let _ = timeout; // Installer scripts have their own durable status and resume markers.
-    Ok(output)
+    Ok(())
+}
+
+fn read_capped<R: Read>(mut reader: R) -> String {
+    const MAX: usize = 4 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if bytes.len() < MAX {
+                    let take = n.min(MAX - bytes.len());
+                    bytes.extend_from_slice(&buffer[..take]);
+                }
+            }
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn tail_text(value: &str, max_chars: usize) -> String {
