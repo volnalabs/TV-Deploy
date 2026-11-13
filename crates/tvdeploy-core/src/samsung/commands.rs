@@ -114,6 +114,108 @@ impl Invocation {
             ],
         }
     }
+
+    /// Samsung online-CA author certificate. The password is supplied through the
+    /// documented hidden-prompt environment variable by runner::run_with_env,
+    /// never as a command-line argument.
+    pub fn generate_samsung_author(profile: &str, identity: &str) -> Result<Self, ValidationError> {
+        validate_profile(profile)?;
+        validate_identity(identity)?;
+        Ok(Self {
+            script: Script::CertManager,
+            args: vec![
+                "generate-samsung-author".into(),
+                "--profile-name".into(),
+                profile.to_string(),
+                "--identity".into(),
+                identity.trim().to_string(),
+                "--prompt-password".into(),
+            ],
+        })
+    }
+
+    /// Samsung online-CA distributor certificate bound to one or more DUIDs.
+    pub fn generate_samsung_distributor(profile: &str, duid: &str) -> Result<Self, ValidationError> {
+        validate_profile(profile)?;
+        if duid.is_empty()
+            || duid.len() > 256
+            || duid.contains(['\\n', '\\r', '\\0'])
+            || !duid.bytes().all(|b| b.is_ascii_alphanumeric() || b"#.-:_".contains(&b))
+        {
+            return Err(ValidationError::BadPath);
+        }
+        Ok(Self {
+            script: Script::CertManager,
+            args: vec![
+                "generate-samsung-distributor".into(),
+                "--profile-name".into(),
+                profile.to_string(),
+                "--duid-list".into(),
+                duid.to_string(),
+                "--privilege".into(),
+                "Public".into(),
+                "--prompt-password".into(),
+            ],
+        })
+    }
+
+    pub fn create_samsung_profile(profile: &str) -> Result<Self, ValidationError> {
+        validate_profile(profile)?;
+        Ok(Self {
+            script: Script::CertManager,
+            args: vec![
+                "create-samsung-profile".into(),
+                "--profile-name".into(),
+                profile.to_string(),
+                "--active".into(),
+            ],
+        })
+    }
+
+    pub fn remove_samsung_profile(profile: &str) -> Result<Self, ValidationError> {
+        validate_profile(profile)?;
+        Ok(Self {
+            script: Script::CertManager,
+            args: vec![
+                "remove-profile".into(),
+                "--profile-name".into(),
+                profile.to_string(),
+            ],
+        })
+    }
+
+    pub fn install_package(path: &str, serial: &str, run_after_install: bool) -> Result<Self, ValidationError> {
+        check_cli_path(path)?;
+        parse_serial(serial)?;
+        let mut args = vec![
+            "install".into(),
+            "--package".into(),
+            path.to_string(),
+            "--device-serial".into(),
+            serial.to_string(),
+        ];
+        if run_after_install {
+            args.push("--run".into());
+        }
+        Ok(Self { script: Script::ProjectManager, args })
+    }
+}
+
+fn validate_profile(profile: &str) -> Result<(), ValidationError> {
+    let valid = (3..=64).contains(&profile.len())
+        && profile.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    if valid { Ok(()) } else { Err(ValidationError::BadPath) }
+}
+
+fn validate_identity(identity: &str) -> Result<(), ValidationError> {
+    let value = identity.trim();
+    if (2..=120).contains(&value.chars().count())
+        && !value.chars().any(|c| c.is_control())
+    {
+        Ok(())
+    } else {
+        Err(ValidationError::BadPath)
+    }
 }
 
 #[cfg(test)]
