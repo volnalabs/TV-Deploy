@@ -1,4 +1,4 @@
-//! Tauri commands. Every argument is validated here (and again inside `tvdeploy-core`) before
+//! Tauri commands. Every argument is validated here (and again inside `easytizen-core`) before
 //! anything is executed.
 
 use crate::settings::{self, SavedCertificateProfile, SavedDevice, Settings};
@@ -10,13 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, State};
-use tvdeploy_core::connectivity::{local_ip_towards, probe_tcp, Probe, MIN_DIAGNOSTIC_TIMEOUT};
-use tvdeploy_core::diagnostics::{self, Diagnosis};
-use tvdeploy_core::package::{analyze_wgt, PackageError, PackageReport};
-use tvdeploy_core::samsung::commands::Invocation;
-use tvdeploy_core::samsung::results::{connect_result, duid_result};
-use tvdeploy_core::samsung::runner::{run, run_with_env, CancelToken, RunError, RunOptions, RunOutput};
-use tvdeploy_core::validate::{self, parse_port, parse_tv_ip};
+use easytizen_core::connectivity::{local_ip_towards, probe_tcp, Probe, MIN_DIAGNOSTIC_TIMEOUT};
+use easytizen_core::diagnostics::{self, Diagnosis};
+use easytizen_core::package::{analyze_wgt, PackageError, PackageReport};
+use easytizen_core::samsung::commands::Invocation;
+use easytizen_core::samsung::results::{connect_result, duid_result};
+use easytizen_core::samsung::runner::{run, run_with_env, CancelToken, RunError, RunOptions, RunOutput};
+use easytizen_core::validate::{self, parse_port, parse_tv_ip};
 
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -494,7 +494,7 @@ pub async fn install_package(
             code: "sign_failed".into(),
             detail: Some(format!("The signed WGT could not be inspected: {e}")),
         })?;
-        if signed_report.signature != tvdeploy_core::package::SignatureState::SignedStructure {
+        if signed_report.signature != easytizen_core::package::SignatureState::SignedStructure {
             return Err(ApiError {
                 code: "sign_failed".into(),
                 detail: Some("The Tizen signer returned success, but the WGT does not contain both Samsung signature files. Installation was stopped.".into()),

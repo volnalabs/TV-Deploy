@@ -9,28 +9,13 @@ use super::envelope::{parse_envelope, Envelope};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use thiserror::Error;
 
 const MAX_CAPTURE: usize = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
-
-impl CancelToken {
-    pub fn new() -> Self {
-        Self::default()
-    }
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
+pub use crate::cancel::CancelToken;
 
 #[derive(Debug, Clone)]
 pub struct Toolchain {
@@ -312,7 +297,7 @@ mod e2e_mock_sdb {
         let home = tempfile::tempdir().unwrap();
         let sdk = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(sdk.path().join("tools")).unwrap();
-        let mock = repo().join("crates/tvdeploy-core/tests/fixtures/mock-sdk/tools/sdb");
+        let mock = repo().join("crates/easytizen-core/tests/fixtures/mock-sdk/tools/sdb");
         std::fs::copy(&mock, sdk.path().join("tools/sdb")).unwrap();
         let tc = Toolchain {
             node,

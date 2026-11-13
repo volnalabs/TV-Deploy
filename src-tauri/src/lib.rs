@@ -9,7 +9,7 @@ mod sdk_installer;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::Manager;
-use tvdeploy_core::samsung::runner::CancelToken;
+use easytizen_core::samsung::runner::CancelToken;
 
 pub struct AppState {
     pub data_dir: std::path::PathBuf,

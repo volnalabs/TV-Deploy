@@ -1,7 +1,7 @@
 # Direct dependencies (iteration 1)
 
 ## Rust (workspace; full tree: `cargo tree`, lockfile: Cargo.lock)
-### tvdeploy-core
+### easytizen-core
 - roxmltree ^0.20
 - serde ^1
 - serde_json ^1
@@ -13,7 +13,7 @@
 - serde_json ^1
 - tauri ^2
 - tauri-plugin-dialog ^2
-- tvdeploy-core *
+- easytizen-core *
 - tauri-build ^2 (build)
 
 ## npm (lockfile: package-lock.json)

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
-use tvdeploy_core::samsung::runner::{sdb_path, Toolchain};
+use easytizen_core::samsung::runner::{sdb_path, Toolchain};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]

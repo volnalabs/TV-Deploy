@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tvdeploy-core", "src-tauri"]
+members = ["crates/easytizen-core", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,3 +13,7 @@ lto = true
 codegen-units = 1
 opt-level = "s"
 strip = true
+
+# Optimise dependencies in debug/test builds too: RSA key generation is unusably slow otherwise.
+[profile.dev.package."*"]
+opt-level = 2

@@ -17,9 +17,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "clippy, rustfmt" }
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -p tvdeploy-core -- --check
-      - run: cargo clippy -p tvdeploy-core --all-targets -- -D warnings
-      - run: cargo test -p tvdeploy-core
+      - run: cargo fmt -p easytizen-core -- --check
+      - run: cargo clippy -p easytizen-core --all-targets -- -D warnings
+      - run: cargo test -p easytizen-core
   frontend:
     runs-on: ubuntu-latest
     steps:

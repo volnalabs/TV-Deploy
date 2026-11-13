@@ -1,12 +1,12 @@
 # Architecture (iteration 1)
 
 ```
-React/TS UI  ──invoke(typed)──▶  src-tauri (Rust)  ──▶  tvdeploy-core  ──argv──▶  bundled node
+React/TS UI  ──invoke(typed)──▶  src-tauri (Rust)  ──▶  easytizen-core  ──argv──▶  bundled node
  (no process,                     validates args,        pure logic, tested        └▶ vendored Samsung
   no fs access)                   settings, state                                      tizen-sdk-skills CLI ──▶ sdb ──▶ TV
 ```
 
-* `crates/tvdeploy-core` — validation, safe WGT analysis, typed Samsung CLI invocations, envelope parsing,
+* `crates/easytizen-core` — validation, safe WGT analysis, typed Samsung CLI invocations, envelope parsing,
   diagnostics, TCP pre-checks. No Tauri dependency; fully unit-tested.
 * `src-tauri` — thin command layer (`api.rs`), non-secret settings, toolchain location.
 * `resources/samsung-cli` — Samsung `tizen-sdk-skills` `common/lib` + TV CA certs, pinned (see `PINNED.json`),

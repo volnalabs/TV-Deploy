@@ -12,7 +12,7 @@ The earlier development report recorded:
 ## CI failures found during integration
 
 The latest development commit before this PR (`a492e58`) had four CI issues, now corrected in this PR:
-- Rust formatting differences in `tvdeploy-core/src/samsung/commands.rs`.
+- Rust formatting differences in `easytizen-core/src/samsung/commands.rs`.
 - An unused React icon import, rejected by TypeScript's no-unused-locals check.
 - Missing `tempfile` dev-dependency for Tauri crate tests.
 - A moved-value error in the toolchain status response.
