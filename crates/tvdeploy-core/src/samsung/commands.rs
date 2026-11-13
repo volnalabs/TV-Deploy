@@ -215,7 +215,9 @@ impl Invocation {
 
 fn validate_profile(profile: &str) -> Result<(), ValidationError> {
     let valid = (3..=64).contains(&profile.len())
-        && profile.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        && profile
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
     if valid {
         Ok(())
     } else {
