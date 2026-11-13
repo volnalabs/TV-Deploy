@@ -12,6 +12,13 @@ pub struct SavedDevice {
     pub duid: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SavedCertificateProfile {
+    pub name: String,
+    pub identity: String,
+    pub duid: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -25,6 +32,9 @@ pub struct Settings {
     /// Saved TVs are remembered between launches but are never treated as connected without a
     /// fresh check.
     pub devices: Vec<SavedDevice>,
+    /// Public metadata only. Private keys and passwords remain in the Tizen SDK's
+    /// platform-protected keystore and are never copied into settings.json.
+    pub certificate_profiles: Vec<SavedCertificateProfile>,
 }
 
 impl Default for Settings {
@@ -36,6 +46,7 @@ impl Default for Settings {
             default_port: 26101,
             timeout_ms: 3000,
             devices: vec![],
+            certificate_profiles: vec![],
         }
     }
 }

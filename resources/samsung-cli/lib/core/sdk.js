@@ -1,0 +1,4570 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Samsung Electronics Co., Ltd.
+
+/**
+ * SDK domain: initialization / status check / pre-install verification / TV SDK extension
+ *
+ * Manages SDK path config (~/.tizen.sdk.path.config) and determines installation status.
+ * Does not execute actual installation (10-15 minutes) but performs pre-verification only,
+ * and guides the agent to execute the installer script in background.
+ */
+
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
+
+const DEFAULT_DOWNLOAD_JOBS = 4;
+
+function normalizeDownloadJobs(value = DEFAULT_DOWNLOAD_JOBS) {
+  const jobs = Number(value);
+  if (!Number.isInteger(jobs) || jobs < 1 || jobs > 8) {
+    throw new Error("download-jobs must be an integer from 1 to 8");
+  }
+  return jobs;
+}
+
+/**
+ * The `-DownloadJobs n` / `--download-jobs n` flag pair every installer script
+ * accepts, validated exactly once. All script command lines are built from
+ * this so the two OS variants cannot drift apart.
+ *
+ * @param {number|string} [value]
+ * @returns {{win: string, unix: string}}
+ */
+function downloadJobsFlags(value = DEFAULT_DOWNLOAD_JOBS) {
+  const jobs = normalizeDownloadJobs(value);
+  return { win: `-DownloadJobs ${jobs}`, unix: `--download-jobs ${jobs}` };
+}
+const {
+  formatSdkInit,
+  formatSdkStatus,
+  formatSdkInstall,
+  formatError,
+  formatTvSdkInstall,
+  formatPackageUpdate,
+  formatRepoInfo,
+  formatEmulatorPackageDownload,
+  formatRepoUrlValidation,
+  formatCustomRepoInstall,
+  formatPlatformInstall,
+  formatPlatformList,
+  formatMobilePlatformDownload,
+  formatRootstrapInstall,
+} = require("../envelope/response-formatter");
+
+const { resolveScript, execPluginScript } = require("./plugin-cache");
+const { checkShellSafe } = require("./shell-safety");
+const { checkNode, checkDiskSpace } = require("./preflight");
+
+/**
+ * Add checkNode's warnings to an install envelope.
+ *
+ * installSdk / installSdkFromRepo run checkNode first and then return
+ * envelopes from many later steps; without this its warnings (Node below the
+ * supported floor, `node` not on the PATH of spawned shells) never reach the
+ * user. Failure envelopes carry no warnings array of their own, so one is
+ * created (same pattern as jobs.js). Duplicates are skipped.
+ *
+ * @param {object} env - Standard JSON Envelope
+ * @param {string[]} warnings - checkNode(...).warnings
+ * @returns {object} the same envelope
+ */
+function withNodeWarnings(env, warnings) {
+  if (!env || typeof env !== "object" || !warnings || !warnings.length) {
+    return env;
+  }
+  if (!Array.isArray(env.warnings)) env.warnings = [];
+  const fresh = warnings.filter((w) => !env.warnings.includes(w));
+  env.warnings.unshift(...fresh);
+  return env;
+}
+
+const CONFIG_FILE = path.join(os.homedir(), ".tizen.sdk.path.config");
+const DEFAULT_SDK_PATH = path.join(os.homedir(), "tizen-sdk");
+
+// The installer branches (10-15 min downloads) run inline only inside the
+// pkg-compiled tizen-cli; agent harnesses get the command back as
+// suggested_fix instead. The env toggle lets the integration suite exercise
+// the inline branch under `node tizen-sdk.js` against a throwaway home.
+function runsInstallerInline() {
+  return !!process.pkg || process.env.TIZEN_SDK_INLINE_INSTALLER === "1";
+}
+
+/**
+ * SDK initialization: set path and create config file
+ *
+ * @param {string} sdkPath - Tizen SDK installation path
+ * @param {string} [command] - Command name for the envelope (default: 'tizen-sdk sdk-init')
+ * @returns {object} Standard JSON Envelope
+ */
+async function initSdk(sdkPath, command = "tizen-sdk sdk-init") {
+  try {
+    // Validate path
+    if (!sdkPath || typeof sdkPath !== "string") {
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "SDK path must be a non-empty string",
+        "tizen-sdk sdk-init --sdk-path /opt/tizen-studio",
+      );
+    }
+
+    if (!fs.existsSync(sdkPath)) {
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        `SDK path does not exist: ${sdkPath}`,
+        `Verify that Tizen SDK is installed at ${sdkPath}`,
+      );
+    }
+
+    // Check read/write permissions
+    try {
+      fs.accessSync(sdkPath, fs.constants.R_OK | fs.constants.W_OK);
+    } catch (_e) {
+      return formatError(
+        command,
+        "sdk_path_not_accessible",
+        `No read/write permission for SDK path: ${sdkPath}`,
+      );
+    }
+
+    fs.writeFileSync(CONFIG_FILE, sdkPath, "utf-8");
+
+    // POSIX: user-only permissions (Windows does not support chmod, so just create)
+    if (process.platform !== "win32") {
+      fs.chmodSync(CONFIG_FILE, 0o600);
+    }
+
+    return formatSdkInit(sdkPath, CONFIG_FILE, command);
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to initialize SDK: ${error.message}`,
+    );
+  }
+}
+
+/**
+ * Query SDK status
+ *
+ * @returns {object} Standard JSON Envelope
+ */
+async function getSdkStatus(command = "tizen-sdk sdk-status") {
+  try {
+    if (!fs.existsSync(CONFIG_FILE)) {
+      return formatError(
+        command,
+        "sdk_path_not_set",
+        "SDK path is not configured",
+        "tizen-sdk sdk-init --sdk-path /opt/tizen-studio",
+      );
+    }
+
+    const sdkPath = fs.readFileSync(CONFIG_FILE, "utf-8").trim();
+
+    if (!sdkPath) {
+      return formatError(
+        command,
+        "sdk_path_not_set",
+        "SDK path configuration is empty",
+      );
+    }
+
+    if (!fs.existsSync(sdkPath)) {
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        `Configured SDK path does not exist: ${sdkPath}`,
+        "tizen-sdk sdk-init --sdk-path /opt/tizen-studio",
+      );
+    }
+
+    return formatSdkStatus(sdkPath, command);
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to read SDK status: ${error.message}`,
+    );
+  }
+}
+
+/**
+ * Scan installed SDK components and generate package list
+ *
+ * One "Tizen SDK X.Y" entry per platform the user installed, oldest first,
+ * with the same status and profiles as platform-install --list
+ * (installedPlatformEntries, read from .platform-installed). Listing every
+ * platforms/tizen-X.Y reported 2.4 … 9.0 as installed on an SDK where only
+ * TIZEN-10.0, TIZEN-11.0 and the 10.0 TV extension were installed: the TV
+ * extension lays down tv / tv-samsung for those older versions too. The
+ * "Tizen SDK Tools" entry is gone with it; it only repeated a version label.
+ *
+ * @param {string} sdkPath - SDK installation path
+ * @param {string} version - version label for the fallback entry
+ * @returns {Array<{name: string, status: string, version: string, profiles?: string[]}>}
+ */
+function collectInstalledPackages(sdkPath, version) {
+  const packages = installedPlatformEntries(sdkPath).map((e) => ({
+    name: `Tizen SDK ${e.version}`,
+    status: e.status,
+    version: e.version,
+    profiles: e.profiles,
+  }));
+
+  if (packages.length === 0) {
+    packages.push({
+      name: `Tizen SDK ${version}`,
+      status: "installed",
+      version,
+    });
+  }
+
+  return packages;
+}
+
+/**
+ * result.packages of a successful sdk-install / sdk-install-custom-repo: the
+ * installed-platform entries (collectInstalledPackages). Both commands use
+ * this so the same SDK reports the same packages. The version label
+ * (installedVersionLabel: the requested version, else the newest installed
+ * one) only names the fallback entry of an SDK that reports no platform.
+ *
+ * @param {string} sdkPath
+ * @param {string} version - requested version ("" = none requested)
+ */
+function installedPackageSummary(sdkPath, version) {
+  return collectInstalledPackages(
+    sdkPath,
+    installedVersionLabel(sdkPath, version),
+  );
+}
+
+/**
+ * Tizen platform versions are MAJOR.MINOR — the X.Y in the TIZEN-X.Y package.
+ *
+ * This is the shell-safety screen for the value (see validateTizenVersion),
+ * so it is deliberately an ASCII whitelist: `[0-9]` (not `\d`, which reads
+ * the same in JS but is less obviously ASCII-only to a reviewer), a literal
+ * dot, and `^…$` without the `m` flag — in JS `$` then matches only at the
+ * very end of the string, never before a trailing newline. Every accepted
+ * value is therefore a subset of shell-safety.js UNSAFE_SHELL_CHARS'
+ * complement; sdk-install-version.test.js cross-checks that invariant.
+ */
+const TIZEN_VERSION_RE = /^[0-9]+\.[0-9]+$/;
+
+/**
+ * Validate a requested Tizen platform version (--tizen-version /
+ * --platform-version). Empty means "auto-select the newest platform the
+ * repository offers" and is always accepted.
+ *
+ * The value is later spliced into the installer command line
+ * (-Platform "<v>" / --platform "<v>"), so anything but ASCII digits and a
+ * dot is rejected here — that doubles as the shell-safety screen for this
+ * argument.
+ *
+ * @param {*} version - raw option value
+ * @param {{required?: boolean}} [opts] - required: the caller insists on a
+ *   version (platform-install), so the "omit it" hint is left out
+ * @returns {{version: string, error: string|null}} trimmed value, or an error message
+ */
+function validateTizenVersion(version, opts = {}) {
+  const v = version == null ? "" : String(version).trim();
+  if (!v) return { version: "", error: null };
+  if (!TIZEN_VERSION_RE.test(v)) {
+    return {
+      version: v,
+      error:
+        `Invalid Tizen platform version "${v}". Expected MAJOR.MINOR such as 10.0 or 11.0 ` +
+        "(the X.Y of the TIZEN-X.Y platform package)." +
+        (opts.required
+          ? ""
+          : " Omit the version to install the newest one available."),
+    };
+  }
+  return { version: v, error: null };
+}
+
+/**
+ * Platform versions present in an installed SDK — every
+ * `{sdkPath}/platforms/tizen-X.Y` directory as "X.Y", sorted ascending by
+ * major then minor. Empty when the SDK or its platforms directory is missing.
+ *
+ * @param {string} sdkPath
+ * @returns {string[]}
+ */
+const PLATFORM_DIR_RE = /^tizen-(\d+\.\d+)$/i;
+
+/**
+ * Numeric "X.Y" ordering: 9.0 < 10.0 < 10.5 < 11.0 (a lexical sort would put
+ * 10.0 before 9.0). Both inputs are guaranteed X.Y by PLATFORM_DIR_RE.
+ */
+function comparePlatformVersions(a, b) {
+  const [aMajor, aMinor] = a.split(".").map(Number);
+  const [bMajor, bMinor] = b.split(".").map(Number);
+  return aMajor - bMajor || aMinor - bMinor;
+}
+
+/**
+ * Names of the sub-directories of `dir`; [] when it is missing or unreadable.
+ *
+ * A symbolic link (or Windows junction) to a directory counts as one. Moving a
+ * large platform or profile directory (rootstraps, emulator-images) to another
+ * disk and linking it back is common, and the script mirrors (the directory
+ * glob in platform_installed, Get-ChildItem -Directory in
+ * Test-PlatformInstalled) already follow such links. Dirent.isDirectory()
+ * alone is false for a link, so that platform read as not installed here
+ * while the scripts saw it installed. A dangling link is skipped.
+ */
+function listSubdirectories(dir) {
+  try {
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((entry) => {
+        if (entry.isDirectory()) return true;
+        if (!entry.isSymbolicLink()) return false;
+        try {
+          return fs.statSync(path.join(dir, entry.name)).isDirectory();
+        } catch (_e) {
+          return false;
+        }
+      })
+      .map((entry) => entry.name);
+  } catch (_e) {
+    return [];
+  }
+}
+
+function listInstalledPlatformVersions(sdkPath) {
+  if (!sdkPath) return [];
+  return listSubdirectories(path.join(sdkPath, "platforms"))
+    .map((name) => PLATFORM_DIR_RE.exec(name))
+    .filter(Boolean)
+    .map((m) => m[1])
+    .sort(comparePlatformVersions);
+}
+
+/**
+ * Marker tizen-platform-install writes before it installs TIZEN-X.Y and
+ * removes once that install succeeds. Mirrored in tizen-platform-install.{sh,ps1}.
+ */
+function platformInstallingMarker(sdkPath, version) {
+  return path.join(sdkPath, `.platform-installing-${version}`);
+}
+
+/**
+ * Sub-directories of platforms/tizen-X.Y that are not a platform profile.
+ * The base SDK ships "common" (features, privileges, on-demand) for every
+ * older API version too, so platforms/tizen-9.0/common alone does NOT mean
+ * TIZEN-9.0 is installed.
+ */
+const PLATFORM_SHARED_DIRS = ["common"];
+
+/**
+ * Entries of a profile directory that do not make it a platform payload:
+ * tizen-create-project syncs the plugin's templates into
+ * platforms/<profile>/tizen/samples, which creates that directory even for a
+ * version whose platform was never installed.
+ */
+const PROFILE_NON_PAYLOAD = ["samples"];
+
+/**
+ * platforms/tizen-X.Y of this SDK, or null. Looked up by name the way
+ * listInstalledPlatformVersions matches it (case-insensitive), so
+ * "Tizen-13.0" works on a case-sensitive file system too.
+ */
+function platformDirPath(sdkPath, version) {
+  if (!sdkPath || !version) return null;
+  const platformsDir = path.join(sdkPath, "platforms");
+  const dirName = listSubdirectories(platformsDir).find((name) => {
+    const m = PLATFORM_DIR_RE.exec(name);
+    return m && m[1] === version;
+  });
+  return dirName ? path.join(platformsDir, dirName) : null;
+}
+
+/** Sub-directories of platforms/tizen-X.Y, sorted; [] when it is missing. */
+function platformProfiles(sdkPath, version) {
+  const dir = platformDirPath(sdkPath, version);
+  return dir ? listSubdirectories(dir).sort() : [];
+}
+
+/**
+ * Profiles of platforms/tizen-X.Y that hold a platform payload, sorted:
+ * every sub-directory except the shared "common" data, and except a profile
+ * directory that is empty or holds only synced template "samples" (what
+ * tizen-create-project leaves in platforms/tizen-X.Y/tizen for a version
+ * whose tizen profile was never installed). This is what result.packages and
+ * platform-install --list report as `profiles`, so "installed but no `tizen`
+ * in profiles" really means the tizen profile is absent.
+ *
+ * @param {string} sdkPath
+ * @param {string} version - "X.Y"
+ * @returns {string[]}
+ */
+function platformPayloadProfiles(sdkPath, version) {
+  const dir = platformDirPath(sdkPath, version);
+  if (!dir) return [];
+  return platformProfiles(sdkPath, version)
+    .filter((p) => !PLATFORM_SHARED_DIRS.includes(p))
+    .filter((p) => {
+      let entries;
+      try {
+        entries = fs.readdirSync(path.join(dir, p));
+      } catch (_e) {
+        return false;
+      }
+      return entries.some((e) => !PROFILE_NON_PAYLOAD.includes(e));
+    });
+}
+
+/**
+ * Is TIZEN-X.Y installed? platforms/tizen-X.Y holds a platform profile — a
+ * sub-directory besides "common" (e.g. "tizen") with content besides the
+ * synced "samples" (rootstraps, emulator-images, features, ...) — and no
+ * tizen-platform-install run of that version is still marked in progress.
+ *
+ * The directory is the source of truth here: create-project and
+ * list-templates --platform-version accept any version whose files are on
+ * disk, including a tv / tv-samsung folder the TV extension bundled for an
+ * older version. What the user installed is .platform-installed
+ * (installedPlatformEntries); the installers' own "already installed" check
+ * leaves the TV folders out (isTizenPlatformInstalled).
+ * A run that failed partway leaves its in-progress marker, so its half-filled
+ * directory does not count until a re-run (which resumes) completes it.
+ *
+ * @param {string} sdkPath
+ * @param {string} version - "X.Y"
+ * @returns {boolean}
+ */
+function isPlatformInstalled(sdkPath, version) {
+  if (
+    !platformDirPath(sdkPath, version) ||
+    fs.existsSync(platformInstallingMarker(sdkPath, version))
+  ) {
+    return false;
+  }
+  return platformPayloadProfiles(sdkPath, version).length > 0;
+}
+
+/**
+ * Is the TIZEN-X.Y platform package itself installed? isPlatformInstalled
+ * without the TV extension's profiles (tv, tv-samsung*): the TV extension
+ * lays those down for older versions too, and tizen-9.0/tv alone must not
+ * make sdk-install --tizen-version 9.0 or platform-install 9.0 answer
+ * "already installed".
+ *
+ * Mirrored by platform_installed (scripts/lib/common.sh) and
+ * Test-PlatformInstalled (scripts/lib/common.ps1), the installers' check.
+ *
+ * @param {string} sdkPath
+ * @param {string} version - "X.Y"
+ * @returns {boolean}
+ */
+function isTizenPlatformInstalled(sdkPath, version) {
+  return (
+    isPlatformInstalled(sdkPath, version) &&
+    platformPayloadProfiles(sdkPath, version).some((p) => !isTvProfile(p))
+  );
+}
+
+/** Installed platform versions (isPlatformInstalled), oldest first. */
+function listFullyInstalledPlatformVersions(sdkPath) {
+  return listInstalledPlatformVersions(sdkPath).filter((v) =>
+    isPlatformInstalled(sdkPath, v),
+  );
+}
+
+/**
+ * The record of the platforms the user installed: one block per successful
+ * install, appended by every installer (record_platform_install in
+ * scripts/lib/common.sh, Add-PlatformRecord in scripts/lib/common.ps1):
+ *
+ *   Platform package installed at 2026-11-03T10:00:00+09:00
+ *   Target: TIZEN-11.0            (TV-SAMSUNG-Public, TV-SAMSUNG ZIP)
+ *   Platform version: 11.0
+ *   Profile: tizen                (tv-samsung; several are comma-separated)
+ *   Installed by: sdk-install     (platform-install, tv-sdk-install,
+ *                                  tv-sdk-install-from-zip)
+ *   Source: <repository URL or ZIP path>   (optional)
+ *
+ * The directories under platforms/ cannot say which versions the user asked
+ * for: the TV extension lays down tv / tv-samsung for 2.4 … 9.0 next to the
+ * one TV version it is for, so every one of them looked installed.
+ */
+function platformRecordPath(sdkPath) {
+  return path.join(sdkPath, ".platform-installed");
+}
+
+/** Profiles that belong to the TV extension, not to a TIZEN-X.Y platform. */
+function isTvProfile(profile) {
+  return profile === "tv" || profile.startsWith("tv-samsung");
+}
+
+/**
+ * Blocks of .platform-installed, in file order. A block written before the
+ * Profile line existed gets it from its Target: TV-… is tv-samsung, anything
+ * else (TIZEN-X.Y) is tizen. A block without a valid X.Y version is skipped.
+ *
+ * @param {string} sdkPath
+ * @returns {Array<{version: string, profiles: string[], target: string, installedBy: string, source: string}>}
+ */
+function readPlatformRecords(sdkPath) {
+  let text;
+  try {
+    text = fs.readFileSync(platformRecordPath(sdkPath), "utf8");
+  } catch (_e) {
+    return [];
+  }
+  const records = [];
+  let cur = null;
+  const flush = () => {
+    if (cur && /^[0-9]+\.[0-9]+$/.test(cur.version)) {
+      if (cur.profiles.length === 0) {
+        cur.profiles = [/^TV-/i.test(cur.target) ? "tv-samsung" : "tizen"];
+      }
+      records.push(cur);
+    }
+    cur = null;
+  };
+  // A file first written by Windows PowerShell 5.1's Add-Content carries a BOM.
+  for (const raw of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.startsWith("Platform package installed at")) {
+      flush();
+      cur = {
+        version: "",
+        profiles: [],
+        target: "",
+        installedBy: "",
+        source: "",
+      };
+      continue;
+    }
+    if (!cur) continue;
+    const m = /^([A-Za-z ]+):\s*(.*)$/.exec(line);
+    if (!m) continue;
+    const [, key, value] = m;
+    if (key === "Target") cur.target = value;
+    else if (key === "Platform version") cur.version = value;
+    else if (key === "Profile") {
+      cur.profiles = value
+        .split(",")
+        .map((p) => p.trim())
+        .filter(Boolean);
+    } else if (key === "Installed by") cur.installedBy = value;
+    else if (key === "Source") cur.source = value;
+  }
+  flush();
+  return records;
+}
+
+/** The TV version an older .tv-sdk-installed names ("TV milestone version: X.Y"), or "". */
+function legacyTvMarkerVersion(sdkPath) {
+  try {
+    const text = fs.readFileSync(
+      path.join(sdkPath, ".tv-sdk-installed"),
+      "utf8",
+    );
+    const m = /^TV milestone version:\s*([0-9]+\.[0-9]+)\s*$/m.exec(text);
+    return m ? m[1] : "";
+  } catch (_e) {
+    return "";
+  }
+}
+
+/**
+ * Recorded profiles per version (Map "X.Y" → Set of profiles), plus what an
+ * SDK installed before the installers wrote records still needs:
+ *
+ *   - sdk-install did not record its platform. While no block says
+ *     "Installed by: sdk-install", the newest version that holds a non-TV
+ *     payload (isTizenPlatformInstalled, so not one still being installed)
+ *     and is not recorded with one counts — that is the platform the base
+ *     install put in.
+ *   - The TV installers wrote only .tv-sdk-installed. While no block records
+ *     a TV profile and that marker exists, its "TV milestone version" (a ZIP
+ *     install) counts, else the newest version with a tv-samsung payload (the
+ *     online install, which carries one TV version).
+ *
+ * @param {string} sdkPath
+ * @returns {Map<string, Set<string>>}
+ */
+function recordedPlatformProfiles(sdkPath) {
+  const records = readPlatformRecords(sdkPath);
+  const byVersion = new Map();
+  const add = (version, profiles) => {
+    if (!byVersion.has(version)) byVersion.set(version, new Set());
+    for (const p of profiles) byVersion.get(version).add(p);
+  };
+  for (const r of records) add(r.version, r.profiles);
+
+  const onDisk = listInstalledPlatformVersions(sdkPath);
+  const payload = (v) => platformPayloadProfiles(sdkPath, v);
+
+  if (!records.some((r) => r.installedBy === "sdk-install")) {
+    // isTizenPlatformInstalled also skips a version whose
+    // tizen-platform-install run has not finished.
+    const base = [...onDisk].reverse().find((v) => {
+      const recorded = [...(byVersion.get(v) || [])];
+      return (
+        !recorded.some((p) => !isTvProfile(p)) &&
+        isTizenPlatformInstalled(sdkPath, v)
+      );
+    });
+    if (base)
+      add(
+        base,
+        payload(base).filter((p) => !isTvProfile(p)),
+      );
+  }
+
+  const tvRecorded = [...byVersion.values()].some((set) =>
+    [...set].some(isTvProfile),
+  );
+  if (!tvRecorded && fs.existsSync(path.join(sdkPath, ".tv-sdk-installed"))) {
+    const tvPayload = (v) =>
+      payload(v).filter((p) => p.startsWith("tv-samsung"));
+    const milestone = legacyTvMarkerVersion(sdkPath);
+    const tv =
+      milestone && tvPayload(milestone).length > 0
+        ? milestone
+        : [...onDisk].reverse().find((v) => tvPayload(v).length > 0);
+    if (tv) add(tv, tvPayload(tv));
+  }
+  return byVersion;
+}
+
+/**
+ * Does .platform-installed record a TV profile for this version (or, on an
+ * SDK from before the records, does recordedPlatformProfiles infer one)?
+ * The TV installers skip such a version unless --force is given.
+ *
+ * @param {string} sdkPath
+ * @param {string} version - "X.Y"
+ */
+function isTvVersionRecorded(sdkPath, version) {
+  if (!sdkPath || !version) return false;
+  const set = recordedPlatformProfiles(sdkPath).get(version);
+  return !!set && [...set].some(isTvProfile);
+}
+
+/** Text of .tv-sdk-installed, or null when it is missing. */
+function readTvSdkMarker(sdkPath) {
+  try {
+    return fs.readFileSync(path.join(sdkPath, ".tv-sdk-installed"), "utf8");
+  } catch (_e) {
+    return null;
+  }
+}
+
+/** result.packages entries of the TV installers, one per recorded TV version. */
+function tvPackageEntries(name, versions, sdkPath) {
+  const entries = installedPlatformEntries(sdkPath);
+  return [...new Set(versions)].sort(comparePlatformVersions).map((v) => {
+    const e = entries.find((x) => x.version === v);
+    return {
+      name,
+      status: e ? e.status : "installed",
+      version: v,
+      profiles: e ? e.profiles.filter(isTvProfile) : ["tv-samsung"],
+    };
+  });
+}
+
+/**
+ * TV versions tizen-tv-sdk-install (the online repository) installed: its
+ * records, or — for an SDK whose online TV install predates the records —
+ * the TV version recordedPlatformProfiles infers from a .tv-sdk-installed
+ * that has no "Source:" line (only the ZIP installer writes one).
+ *
+ * @param {string} sdkPath
+ * @returns {Array<{name: string, status: string, version: string, profiles: string[]}>}
+ */
+function onlineTvInstalled(sdkPath) {
+  const records = readPlatformRecords(sdkPath).filter(
+    (r) => r.installedBy === "tv-sdk-install" && r.profiles.some(isTvProfile),
+  );
+  let versions = records.map((r) => r.version);
+  if (versions.length === 0) {
+    const marker = readTvSdkMarker(sdkPath);
+    const anyTvRecord = readPlatformRecords(sdkPath).some((r) =>
+      r.profiles.some(isTvProfile),
+    );
+    if (marker !== null && !/^Source:/m.test(marker) && !anyTvRecord) {
+      versions = [...recordedPlatformProfiles(sdkPath)]
+        .filter(([, set]) => [...set].some(isTvProfile))
+        .map(([v]) => v);
+    }
+  }
+  return tvPackageEntries("TV-SAMSUNG-Public", versions, sdkPath);
+}
+
+/** Same file? Case-insensitive on Windows, where the scripts write C:\… paths. */
+function samePath(a, b) {
+  if (!a || !b) return false;
+  const norm = (p) => path.resolve(p).replace(/\\/g, "/");
+  return process.platform === "win32"
+    ? norm(a).toLowerCase() === norm(b).toLowerCase()
+    : norm(a) === norm(b);
+}
+
+/**
+ * TV versions installed from this ZIP: tizen-tv-sdk-install-from-zip records
+ * the ZIP as "Source:". With tvVersion, any TV record of that version counts
+ * (the same TV version may have come from another ZIP or the repository).
+ * An older ZIP install left only .tv-sdk-installed ("Source:" plus
+ * "TV milestone version:"); that still counts for the same ZIP.
+ *
+ * @param {string} sdkPath
+ * @param {string} zipPath
+ * @param {string} [tvVersion] - "X.Y", or "" when not given
+ */
+function zipTvInstalled(sdkPath, zipPath, tvVersion) {
+  const records = readPlatformRecords(sdkPath).filter((r) =>
+    r.profiles.some(isTvProfile),
+  );
+  let versions = records
+    .filter((r) =>
+      tvVersion
+        ? r.version === tvVersion
+        : r.installedBy === "tv-sdk-install-from-zip" &&
+          samePath(r.source, zipPath),
+    )
+    .map((r) => r.version);
+  if (versions.length === 0 && records.length === 0) {
+    const marker = readTvSdkMarker(sdkPath) || "";
+    const source = (/^Source:\s*(.+?)\s*$/m.exec(marker) || [])[1];
+    const milestone = legacyTvMarkerVersion(sdkPath);
+    if (
+      milestone &&
+      samePath(source, zipPath) &&
+      (!tvVersion || tvVersion === milestone)
+    ) {
+      versions = [milestone];
+    }
+  }
+  return tvPackageEntries("TV-SAMSUNG (ZIP)", versions, sdkPath);
+}
+
+/**
+ * The platforms the user installed, oldest first — what sdk-install
+ * result.packages and platform-install --list report. One entry per recorded
+ * version (recordedPlatformProfiles) plus any version whose
+ * tizen-platform-install run has not finished (it records only on success):
+ *
+ *   - status "incomplete" while .platform-installing-X.Y exists; "installed"
+ *     when platforms/tizen-X.Y still holds a recorded profile's payload;
+ *     "not_installed" when the recorded directories are gone.
+ *   - profiles: the recorded profiles still on disk (all recorded ones when
+ *     none is), so a tv / tv-samsung folder the TV extension bundled for an
+ *     older version is not reported as installed.
+ *
+ * @param {string} sdkPath
+ * @returns {Array<{version: string, status: string, profiles: string[]}>}
+ */
+function installedPlatformEntries(sdkPath) {
+  if (!sdkPath) return [];
+  const byVersion = recordedPlatformProfiles(sdkPath);
+  for (const v of listInstalledPlatformVersions(sdkPath)) {
+    if (
+      fs.existsSync(platformInstallingMarker(sdkPath, v)) &&
+      !byVersion.has(v)
+    ) {
+      byVersion.set(v, new Set());
+    }
+  }
+  return [...byVersion.keys()].sort(comparePlatformVersions).map((version) => {
+    const recorded = [...byVersion.get(version)].sort();
+    const present = platformPayloadProfiles(sdkPath, version).filter((p) =>
+      recorded.includes(p),
+    );
+    let status;
+    if (fs.existsSync(platformInstallingMarker(sdkPath, version))) {
+      status = "incomplete";
+    } else {
+      status = present.length > 0 ? "installed" : "not_installed";
+    }
+    return {
+      version,
+      status,
+      profiles: present.length > 0 ? present : recorded,
+    };
+  });
+}
+
+/**
+ * Emulator images present on disk — every
+ * `{sdkPath}/platforms/tizen-X.Y/<profile>/emulator-images/<image>/` directory,
+ * regardless of which installer put it there. The .emulator-package-installed
+ * marker only records installs made by tizen-download-emulator-package; the
+ * SDK / TV SDK / platform installers ship emulator images too but never write
+ * that marker, so the marker alone under-reports what is actually installed.
+ *
+ * Sorted by platform (major, minor), then profile, then image name. Empty when
+ * the SDK or its platforms directory is missing.
+ *
+ * @param {string} sdkPath
+ * @returns {Array<{platform: string, profile: string, image: string}>}
+ */
+function listInstalledEmulatorImages(sdkPath) {
+  if (!sdkPath) return [];
+  const platformsDir = path.join(sdkPath, "platforms");
+  const images = [];
+  for (const platformDir of listSubdirectories(platformsDir)) {
+    const m = PLATFORM_DIR_RE.exec(platformDir);
+    if (!m) continue;
+    const profilesDir = path.join(platformsDir, platformDir);
+    for (const profile of listSubdirectories(profilesDir)) {
+      const imagesDir = path.join(profilesDir, profile, "emulator-images");
+      for (const image of listSubdirectories(imagesDir)) {
+        images.push({ platform: m[1], profile, image });
+      }
+    }
+  }
+  return images.sort(
+    (a, b) =>
+      comparePlatformVersions(a.platform, b.platform) ||
+      a.profile.localeCompare(b.profile) ||
+      a.image.localeCompare(b.image),
+  );
+}
+
+/**
+ * "10.0 (tizen, tv-samsung), 11.0 (tizen)" — or "none" when nothing is on disk.
+ *
+ * @param {Array<{platform: string, profile: string}>} images
+ * @returns {string}
+ */
+function describeEmulatorImages(images) {
+  if (!images || images.length === 0) return "none";
+  const byPlatform = new Map();
+  for (const { platform, profile } of images) {
+    if (!byPlatform.has(platform)) byPlatform.set(platform, new Set());
+    byPlatform.get(platform).add(profile);
+  }
+  return [...byPlatform]
+    .map(([platform, profiles]) => `${platform} (${[...profiles].join(", ")})`)
+    .join(", ");
+}
+
+/**
+ * Version label for the "already installed" package summary: the requested
+ * version when one was given, else the newest installed platform.
+ */
+function installedVersionLabel(sdkPath, version) {
+  if (version) return version;
+  const installed = installedTizenPlatformVersions(sdkPath);
+  return installed.length > 0 ? installed[installed.length - 1] : "installed";
+}
+
+/**
+ * The TIZEN-X.Y platforms the user has, oldest first, for messages that
+ * list "installed platforms": installed entries (installedPlatformEntries)
+ * with a non-TV profile. A version that has only TV folders — bundled, or a
+ * TV extension installed for it — is not an installed TIZEN-X.Y, so
+ * "TIZEN-9.0 is not part of it" no longer lists 9.0 as installed.
+ *
+ * @param {string} sdkPath
+ * @returns {string[]}
+ */
+function installedTizenPlatformVersions(sdkPath) {
+  return installedPlatformEntries(sdkPath)
+    .filter(
+      (e) =>
+        e.status === "installed" && e.profiles.some((p) => !isTvProfile(p)),
+    )
+    .map((e) => e.version);
+}
+
+/**
+ * "Already installed" / "installed" must not be reported for a platform
+ * version that was never installed: `sdk-install --tizen-version 99.0` used
+ * to return success on every host that had any SDK, because the pre-check
+ * stopped at sdk.info. When a version was requested explicitly, it has to be
+ * among the installed platforms/tizen-X.Y directories.
+ *
+ * Two call sites, one rule:
+ *   - the pre-check on an SDK that is already installed (afterInstall=false);
+ *   - the packaged CLI right after it ran the installer (afterInstall=true).
+ *     sdk.info alone is not proof that TIZEN-X.Y went in: the installer
+ *     short-circuits on an existing sdk.info before it looks at -Platform, and
+ *     a repository that does not offer the version leaves the SDK untouched,
+ *     so `--tizen-version 99.99` came back as installation_status "completed".
+ *
+ * @param {string} sdkPath - installed SDK root
+ * @param {string} version - requested version ("" = none requested)
+ * @param {string} command - envelope command name
+ * @param {number} startTime
+ * @param {{afterInstall?: boolean}} [opts]
+ * @returns {object|null} failure envelope, or null when the version is present
+ */
+function requestedPlatformMissing(
+  sdkPath,
+  version,
+  command,
+  startTime,
+  opts = {},
+) {
+  if (!version) return null;
+  // platforms/tizen-X.Y with only "common", or only the TV extension's
+  // folders, is not an installed platform (see isTizenPlatformInstalled).
+  if (isTizenPlatformInstalled(sdkPath, version)) return null;
+  const installed = installedTizenPlatformVersions(sdkPath);
+
+  const installedNote =
+    installed.length > 0
+      ? `installed platforms: ${installed.join(", ")}`
+      : "no installed platforms/tizen-X.Y found";
+  const platformInstall = `tizen-sdk platform-install --platform-version ${version}`;
+
+  if (opts.afterInstall) {
+    console.error(
+      `[tizen-sdk] Installer finished, but platform TIZEN-${version} is not in ${sdkPath} (${installedNote}). Not reporting success.`,
+    );
+    return formatError(
+      command,
+      "platform_version_not_found",
+      `The installer finished and sdk.info exists at ${sdkPath}, but the requested platform TIZEN-${version} is not part of the SDK (${installedNote}). ` +
+        "The package repository most likely does not offer that version — existing releases look like 10.0 or 11.0. " +
+        'The SDK itself is installed now, so re-running this command only reports it (and --force would reinstall it): add a version the repository offers with "tizen-sdk platform-install --platform-version <X.Y>".',
+      platformInstall,
+      startTime,
+    );
+  }
+
+  console.error(
+    `[tizen-sdk] SDK is installed but platform TIZEN-${version} is not (${installedNote}).`,
+  );
+  return formatError(
+    command,
+    "platform_version_not_found",
+    `Tizen SDK is installed at ${sdkPath}, but platform TIZEN-${version} is not part of it (${installedNote}). ` +
+      "Check the version — existing releases look like 10.0 or 11.0. " +
+      `To add that platform to this SDK run "${platformInstall}". ` +
+      "Do not re-run this command with --force to get it: that reinstalls the whole SDK (10-15 min). " +
+      "If an install just finished without that version, the repository most likely does not offer it, " +
+      "so platform-install will not find it either — use a version the repository offers. " +
+      "A full reinstall is the user's call.",
+    platformInstall,
+    startTime,
+  );
+}
+
+/**
+ * Where the packaged CLI keeps the output of an installer run that failed:
+ * $TIZEN_LOGS_DIR, else <os tmpdir>/tizen-sdk-skills-logs. Separate from the
+ * jobs directory (job-paths.js), which only exists for detached jobs.
+ */
+function installerLogsDir() {
+  return (
+    process.env.TIZEN_LOGS_DIR ||
+    path.join(os.tmpdir(), "tizen-sdk-skills-logs")
+  );
+}
+
+/**
+ * Last non-empty lines of a script's output, CRLF-normalised and trimmed.
+ *
+ * @param {string} text
+ * @param {number} maxLines
+ * @returns {string[]}
+ */
+function outputTailLines(text, maxLines, maxLineLength = 0) {
+  const lines = String(text || "")
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim() !== "");
+  const tail = lines.slice(-maxLines);
+  if (maxLineLength > 0) {
+    return tail.map((l) =>
+      l.length > maxLineLength ? `${l.slice(0, maxLineLength - 1)}…` : l,
+    );
+  }
+  return tail;
+}
+
+/**
+ * How a child_process (exec|spawn)Sync failure ended. Node does not set
+ * `killed` on these errors: a timeout shows up as `code === "ETIMEDOUT"` with
+ * status null and signal SIGTERM, so `error.killed` would never be true here.
+ *
+ * @param {Error & {status?: number, signal?: string, code?: string}} error
+ * @param {string} subject - e.g. "installer", "install script"
+ * @returns {{text: string, timedOut: boolean, status: number|null, signal: string|null}}
+ */
+function describeChildExit(error, subject) {
+  const status = Number.isInteger(error?.status) ? error.status : null;
+  const signal = error?.signal || null;
+  const timedOut = error?.code === "ETIMEDOUT" || error?.killed === true;
+  let text;
+  if (timedOut) {
+    text = `${subject} timed out and was killed${signal ? ` (${signal})` : ""}`;
+  } else if (signal) {
+    text = `${subject} killed by ${signal}`;
+  } else if (status !== null) {
+    text = `${subject} exit code ${status}`;
+  } else {
+    text = `${subject} could not be run: ${error?.message || "unknown error"}`;
+  }
+  return { text, timedOut, status, signal };
+}
+
+/**
+ * Explain a failed installer run in a way that can still be diagnosed after
+ * the fact.
+ *
+ * A mutating-tier run failed after 763 s with the message
+ * "SDK installation failed: \n\n\n\n\n\n\n" and the same command passed 15 s
+ * later — nothing to go on. The old message was `stdout || stderr || message`:
+ * a whitespace-only stdout is truthy, so the stderr (where the PowerShell
+ * errors were) and the exit code were dropped, and nothing was kept on disk.
+ *
+ * This helper:
+ *   - uses BOTH captured streams (trimmed) and the exit code / signal;
+ *   - says so explicitly when the streams were empty, instead of printing an
+ *     empty string;
+ *   - writes the full captured output to a log file under installerLogsDir()
+ *     and names it in the message;
+ *   - points at the installer's own log (<sdkPath>/.install.log, written by the
+ *     script) and its durable result marker (<sdkPath>/.install-result) when
+ *     they exist.
+ *
+ * Node's execSync message ("Command failed: <full command line>") is not
+ * repeated: the command line is not a diagnosis.
+ *
+ * @param {Error & {stdout?: string, stderr?: string, status?: number, signal?: string, killed?: boolean}} error
+ * @param {{what: string, sdkPath?: string, logGroup: string, tailLines?: number, resumes?: boolean}} o
+ *   what      - subject of the sentence, e.g. "SDK installation"
+ *   sdkPath   - install root, for the script-side log and marker paths
+ *   logGroup  - file-name prefix of the persisted log
+ *   resumes   - the installer skips already-installed packages on a re-run
+ *               (the two SDK installers), so say so
+ * @returns {{message: string, details: string[], log_file: string|null, exit_code: number|null, signal: string|null}}
+ */
+function describeInstallerFailure(error, o) {
+  const tailLines = o.tailLines || 25;
+  const stdout = String(error?.stdout || "");
+  const stderr = String(error?.stderr || "");
+  const exit = describeChildExit(error, "installer");
+  const exitInfo = exit.text;
+  const { status, signal, timedOut } = exit;
+
+  // Both streams, stderr last: the scripts' own [ERROR] lines end up there
+  // on bash (every log_* helper writes to stderr) and PowerShell terminating
+  // errors do too. `details` keeps the lines whole; the message caps each
+  // line so a wide PowerShell error cannot balloon the envelope.
+  const combined = [stdout, stderr].filter((s) => s.trim() !== "").join("\n");
+  const tail = outputTailLines(combined, tailLines);
+  const messageTail = outputTailLines(combined, tailLines, 200);
+
+  let logFile;
+  try {
+    const dir = installerLogsDir();
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    logFile = path.join(dir, `${o.logGroup}-${stamp}.log`);
+    const header =
+      `# ${o.what} failed — ${exitInfo}\n` +
+      `# ${new Date().toISOString()}\n` +
+      (o.sdkPath ? `# sdk path: ${o.sdkPath}\n` : "") +
+      "\n";
+    fs.writeFileSync(
+      logFile,
+      header +
+        "===== stdout =====\n" +
+        (stdout.trim() ? stdout : "(empty)\n") +
+        "\n===== stderr =====\n" +
+        (stderr.trim() ? stderr : "(empty)\n"),
+      "utf-8",
+    );
+  } catch (_e) {
+    logFile = null;
+  }
+
+  const parts = [`${o.what} failed (${exitInfo}).`];
+  if (messageTail.length > 0) {
+    parts.push(
+      `Installer output, last ${messageTail.length} line${messageTail.length === 1 ? "" : "s"}: ${messageTail.join(" | ")}`,
+    );
+  } else {
+    parts.push(
+      "The installer produced no output on the captured stdout/stderr streams.",
+    );
+  }
+  if (logFile) parts.push(`Full captured output: ${logFile}.`);
+  if (o.sdkPath) {
+    const scriptLog = path.join(o.sdkPath, ".install.log");
+    if (fs.existsSync(scriptLog)) {
+      parts.push(`Installer log written by the script: ${scriptLog}.`);
+    }
+    const marker = path.join(o.sdkPath, ".install-result");
+    if (fs.existsSync(marker)) {
+      let recorded;
+      try {
+        recorded = fs.readFileSync(marker, "utf-8").trim();
+      } catch (_e) {
+        recorded = "";
+      }
+      parts.push(
+        `Run-state marker ${marker}${recorded ? ` records "${recorded}"` : " exists"} (query with the installer's -Status / --status flag).`,
+      );
+    }
+    // A kill (timeout) leaves the 'running' marker behind: the script never
+    // reached its exit path, so say that the run was cut short rather than
+    // let the marker suggest an install is still in progress.
+    const running = path.join(o.sdkPath, ".install-running");
+    if (fs.existsSync(running)) {
+      parts.push(
+        timedOut
+          ? `The 'running' marker ${running} is still present because the installer was killed mid-run; the next run clears it.`
+          : `The 'running' marker ${running} is still present — the installer did not reach its exit path (crash or external kill).`,
+      );
+    }
+  }
+  if (o.resumes) {
+    parts.push(
+      "Re-running the same command resumes the install: packages that are already installed are skipped.",
+    );
+  }
+
+  // Envelope `details` is a list of diagnostic lines (see Envelope._normalizeError).
+  const details = [
+    exitInfo,
+    ...(logFile ? [`log_file: ${logFile}`] : []),
+    ...tail,
+  ];
+
+  return {
+    message: parts.join(" "),
+    details,
+    log_file: logFile,
+    exit_code: status,
+    signal,
+  };
+}
+
+/**
+ * Point ~/.tizen.sdk.path.config at sdkPath unless it already does.
+ *
+ * sdk-install's already-installed branch auto-inits the config so every other
+ * skill can locate the SDK. Rewriting a file that already holds the same path
+ * is churn (and normalised the separators the user had written), so compare
+ * resolved paths first and only write when the target differs or is missing.
+ *
+ * @param {string} sdkPath
+ * @param {string} [command]
+ * @returns {Promise<{written: boolean, result: object|null}>}
+ */
+async function ensureSdkPathConfig(sdkPath, command) {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const current = fs.readFileSync(CONFIG_FILE, "utf-8").trim();
+      if (current && path.resolve(current) === path.resolve(sdkPath)) {
+        return { written: false, result: null };
+      }
+    }
+  } catch (_e) {
+    // Unreadable config: fall through and let initSdk report properly.
+  }
+  const result = await initSdk(sdkPath, command);
+  return { written: true, result };
+}
+
+/**
+ * SDK installation pre-check (Phase 1)
+ *
+ * ⚠️ This function does not execute the installer script.
+ * Actual installation (10-15 minutes) is performed by the agent via Bash run_in_background (Phase 2).
+ * Here we only determine the path + validate installation status + return Standard JSON Envelope.
+ *
+ * @param {string} [version] - Tizen platform version (X.Y, e.g. "10.0"). Empty
+ *   = let the installer pick the newest TIZEN-X.Y in the repository. A value
+ *   that is not X.Y fails with invalid_argument; a valid one that is not among
+ *   the installed platforms fails with platform_version_not_found instead of
+ *   being reported as "already installed". The value is forwarded to the
+ *   installer (-Platform / --platform), which rejects versions the repository
+ *   does not offer.
+ * @param {string} label - SDK label (default: 'tizen')
+ * @param {boolean} force - Force reinstall (default: false)
+ * @param {string} [repoUrl] - Custom package repository URL. When given, the
+ *   whole call is handled by installSdkFromRepo(), which validates the URL
+ *   (pkg_list_{OS}-{64,32} must be served) before installing from it instead of
+ *   from the timezone-selected CDN mirror.
+ * @returns {object} Standard JSON Envelope
+ *   - Already installed: success + warnings (exit here)
+ *   - Not installed: failure — guide agent to perform background installation
+ */
+async function installSdk(
+  version = "",
+  _label = "tizen",
+  force = false,
+  repoUrl = "",
+  command = "tizen-sdk sdk-install",
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  // checkNode's warnings are collected in ctx by the steps and merged into
+  // whichever envelope they return — one place, so a new return path cannot
+  // drop them.
+  const ctx = { nodeWarnings: [] };
+  const env = await installSdkSteps(
+    ctx,
+    version,
+    _label,
+    force,
+    repoUrl,
+    command,
+    downloadJobs,
+  );
+  return withNodeWarnings(env, ctx.nodeWarnings);
+}
+
+/**
+ * installSdk() body; records checkNode's warnings in ctx.nodeWarnings.
+ * Call installSdk(), not this: only installSdk() merges those warnings.
+ */
+async function installSdkSteps(
+  ctx,
+  version,
+  _label,
+  force,
+  repoUrl,
+  command,
+  downloadJobs,
+) {
+  // Start time: pass to formatSdkInstall so duration_ms reflects actual work time
+  const startTime = Date.now();
+
+  // 0. Version syntax — before anything else, so a typo fails fast and the
+  // value never reaches a command line unchecked.
+  const versionCheck = validateTizenVersion(version);
+  if (versionCheck.error) {
+    console.error(`[tizen-sdk] ${versionCheck.error}`);
+    return formatError(
+      command,
+      "invalid_argument",
+      versionCheck.error,
+      null,
+      startTime,
+    );
+  }
+  version = versionCheck.version;
+
+  // A custom repository changes the package source, the validation step and the
+  // installer script, so delegate wholesale instead of threading a flag through.
+  if (repoUrl && String(repoUrl).trim()) {
+    return installSdkFromRepo(repoUrl, version, force, downloadJobs);
+  }
+
+  try {
+    // 1. Node.js check (first)
+    console.error("[tizen-sdk] Checking Node.js installation...");
+    const nodeCheck = await checkNode(command);
+    ctx.nodeWarnings = nodeCheck.warnings || [];
+
+    if (nodeCheck.status !== "success") {
+      console.error("[tizen-sdk] Node.js check failed. Aborting installation.");
+      return nodeCheck;
+    }
+    console.error(
+      `[tizen-sdk] Node.js OK (${nodeCheck.result.version}). Continuing.`,
+    );
+
+    const sdkPath = readSdkPath();
+
+    console.error("[tizen-sdk] Checking if SDK is already installed...");
+
+    const statusCheck = await checkIfSdkAlreadyInstalled(sdkPath, force);
+
+    // Already installed = condition met = success (reinstall only via force)
+    // Note: this branch executes in both "already installed when requesting install" and
+    // "re-validation immediately after install" cases, so warning text uses neutral language
+    // that works naturally in both situations.
+    if (statusCheck.alreadyInstalled) {
+      // An explicitly requested platform must actually be installed.
+      const missing = requestedPlatformMissing(
+        sdkPath,
+        version,
+        command,
+        startTime,
+      );
+      if (missing) return missing;
+
+      console.error(
+        "[tizen-sdk] SDK installation verified (sdk.info found). Returning success status.",
+      );
+
+      // Auto-init: write SDK path to ~/.tizen.sdk.path.config so that all other
+      // skills (build, create, device, debug, etc.) can locate the SDK via
+      // readSdkPath().  Without this, the config file may be missing after a
+      // fresh install, causing every downstream skill to fall back to the
+      // default path — which breaks when a custom install path was used.
+      const warnings = [
+        `SDK installation verified at ${sdkPath} (sdk.info found). To force a reinstall, run with --force (script flag: -Force).`,
+      ];
+      // An SDK installed by an older version of this plugin may carry a
+      // comment header / BOM in sdk.info that crashes Tizen CLI; fix it while
+      // we are here so the next build does not fail on it.
+      const repairNote = describeSdkInfoRepair(repairSdkInfo(sdkPath));
+      if (repairNote) warnings.push(repairNote);
+      const { written, result: initResult } = await ensureSdkPathConfig(
+        sdkPath,
+        command,
+      );
+      if (!written) {
+        console.error("[tizen-sdk] SDK path config already points here.");
+      } else if (initResult.status === "success") {
+        console.error("[tizen-sdk] SDK path config written automatically.");
+        warnings.push(
+          `SDK path configured automatically: ${sdkPath} → ${CONFIG_FILE}`,
+        );
+      } else {
+        console.error(
+          "[tizen-sdk] Auto-init failed. Config file may need manual setup.",
+        );
+        warnings.push(
+          `SDK path config could not be written automatically: ${initResult.errors?.[0]?.message || "unknown error"}. Run "tizen-sdk sdk-init" manually.`,
+        );
+      }
+
+      const packages = installedPackageSummary(sdkPath, version);
+      return formatSdkInstall(packages, warnings, startTime, command);
+    }
+
+    if (!statusCheck.shouldProceed) {
+      return formatError(
+        command,
+        "build_failed",
+        statusCheck.reason,
+        null,
+        startTime,
+      );
+    }
+
+    // Not installed → auto-check disk space (user home drive, 15GB threshold)
+    console.error(
+      "[tizen-sdk] SDK not installed. Checking disk space (15 GB required)...",
+    );
+    const diskCheck = await checkDiskSpace(os.homedir(), 15, command);
+
+    if (diskCheck.status !== "success") {
+      // Insufficient disk space → abort installation
+      console.error(
+        "[tizen-sdk] Insufficient disk space. Aborting installation.",
+      );
+      return diskCheck;
+    }
+    console.error(
+      `[tizen-sdk] Disk space OK (${diskCheck.result.free_gb} GB free). Proceeding to install.`,
+    );
+
+    // Resolve installer script
+    const installer = resolveScript("tizen-sdk-install");
+
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // One argument list for both branches below, so the pkg binary and the
+    // suggested_fix command line can never drift apart.
+    const { win: winFlags, unix: unixFlags } = sdkInstallerFlags({
+      sdkPath,
+      version,
+      force,
+      downloadJobs,
+    });
+
+    // In pkg-compiled binary (tizen-cli), execute the installer directly.
+    // In Claude Code / Cline (non-pkg), return the installer command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    if (isPkg) {
+      // Direct execution: run installer script synchronously (10-15 min)
+      console.error(`[tizen-sdk] Running installer: ${installer.scriptPath}`);
+      try {
+        execPluginScript(
+          installer.scriptPath,
+          winFlags.join(" "),
+          unixFlags.join(" "),
+        );
+        console.error("[tizen-sdk] Installer completed.");
+
+        // Verify installation: check sdk.info
+        const sdkInfoPath = path.join(sdkPath, "sdk.info");
+        if (fs.existsSync(sdkInfoPath)) {
+          console.error(
+            "[tizen-sdk] SDK installation verified (sdk.info found).",
+          );
+
+          // sdk.info is necessary, not sufficient: the platform that was asked
+          // for has to be there too (see requestedPlatformMissing).
+          const missing = requestedPlatformMissing(
+            sdkPath,
+            version,
+            command,
+            startTime,
+            { afterInstall: true },
+          );
+          if (missing) return missing;
+
+          // Auto-init: write SDK path to ~/.tizen.sdk.path.config so that all
+          // other skills (build, create, device, debug, etc.) can locate the
+          // SDK via readSdkPath().
+          const warnings = [`SDK installed successfully at ${sdkPath}.`];
+          const initResult = await initSdk(sdkPath, command);
+          if (initResult.status === "success") {
+            console.error("[tizen-sdk] SDK path config written automatically.");
+            warnings.push(
+              `SDK path configured automatically: ${sdkPath} → ${CONFIG_FILE}`,
+            );
+          } else {
+            console.error(
+              "[tizen-sdk] Auto-init failed. Config file may need manual setup.",
+            );
+            warnings.push(
+              `SDK path config could not be written automatically: ${initResult.errors?.[0]?.message || "unknown error"}. Run "tizen-sdk sdk-init" manually.`,
+            );
+          }
+
+          const packages = installedPackageSummary(sdkPath, version);
+          return formatSdkInstall(packages, warnings, startTime, command);
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but sdk.info not found at ${sdkInfoPath}. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "SDK installation",
+          sdkPath,
+          logGroup: "sdk-install",
+          resumes: true,
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): hand the installer to the agent
+      // as suggested_fix — foreground command plus its detached-job twin.
+      const installerCommand = installerFix(
+        "tizen-sdk-install",
+        installer.scriptPath,
+        winFlags.join(" "),
+        unixFlags.join(" "),
+      );
+
+      return formatError(
+        command,
+        "install_required",
+        "SDK is NOT installed. This pre-check CLI cannot install it (10-15 min job). " +
+          harnessGuidance("detach") +
+          sdkPrecheckRerunHint(
+            "<sdk-path>/sdk.info exists and the requested platform is installed",
+          ) +
+          "If the run state is unknown, query it with the installer's -Status (Windows) / --status (bash) flag, " +
+          "or node job-cli.js list for a job started via background_command. " +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install SDK: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Build the platform-appropriate shell command that runs a plugin script.
+ * Used as suggested_fix when this pre-check CLI cannot run the script itself
+ * (installSdk / installTvSdk / updatePackage share this shape).
+ *
+ * @param {string} scriptPath
+ * @param {string} [winArgs] - arguments appended on Windows (PowerShell)
+ * @param {string} [unixArgs] - arguments appended on Linux/macOS (bash)
+ * @returns {string}
+ */
+function buildScriptCommand(scriptPath, winArgs = "", unixArgs = "") {
+  if (process.platform === "win32") {
+    const psPath = scriptPath.replace(/\\/g, "/");
+    return `powershell -ExecutionPolicy Bypass -File "${psPath}"${winArgs ? ` ${winArgs}` : ""}`;
+  }
+  return `bash "${scriptPath}"${unixArgs ? ` ${unixArgs}` : ""}`;
+}
+
+/**
+ * The same installer launch rendered as a detached job for harnesses whose
+ * tool call cannot outlive the install (Codex CLI: 30 s per exec call, issue
+ * #48): `node <lib/cli>/job-cli.js run --script <group> [-- <args>]`. The job
+ * runner resolves <group> through the plugin's own resolveScript(), so it
+ * launches the very file `buildScriptCommand` points at, and the caller polls
+ * `job-cli.js wait --id <job_id>` for the exit code + log tail.
+ *
+ * @param {string} group - scripts/<group>/<group>.{ps1,sh}
+ * @param {string} [winArgs] - arguments appended on Windows (PowerShell)
+ * @param {string} [unixArgs] - arguments appended on Linux/macOS (bash)
+ * @returns {string}
+ */
+function buildJobCommand(group, winArgs = "", unixArgs = "") {
+  const jobCli = path.join(__dirname, "..", "cli", "job-cli.js");
+  const cliPath =
+    process.platform === "win32" ? jobCli.replace(/\\/g, "/") : jobCli;
+  const args = (process.platform === "win32" ? winArgs : unixArgs).trim();
+  return `node "${cliPath}" run --script ${group}${args ? ` -- ${args}` : ""}`;
+}
+
+/**
+ * suggested_fix payload for a Phase-2 installer: the foreground command plus
+ * its detached-job twin. Every long-running pre-check hands both back so each
+ * harness can pick the one it can actually run (see harnessGuidance).
+ *
+ * @param {string} group - scripts/<group>
+ * @param {string|null} scriptPath - resolved installer path (null → not found)
+ * @param {string} [winArgs]
+ * @param {string} [unixArgs]
+ * @param {string} [notFound] - message used as `command` when scriptPath is null
+ */
+/**
+ * The install-path argument for tizen-sdk-install(-custom-repo) in both script
+ * dialects. The JS layer resolves the SDK path (config file → ~/tizen-sdk) and
+ * must hand exactly that path to the installer; left implicit, the installer
+ * fell back to TIZEN_SDK_PATH from the user's shell profile — issue #70 saw
+ * tizen-sdk unpacked into an existing ~/tizen-studio.
+ *
+ * @param {string} sdkPath
+ * @returns {{win: string, unix: string}}
+ */
+function installerPathArgs(sdkPath) {
+  return {
+    win: `-Path "${String(sdkPath).replace(/\\/g, "/")}"`,
+    unix: `--path "${sdkPath}"`,
+  };
+}
+
+/**
+ * Argument lists for scripts/tizen-sdk-install/tizen-sdk-install.{ps1,sh},
+ * in the order the installer documents them:
+ *
+ *   -Path "<sdk>" [-Platform "<X.Y>"] [-Force] -DownloadJobs <n>      (PowerShell)
+ *   --path "<sdk>" [--platform "<X.Y>"] [--force] --download-jobs <n>  (bash)
+ *
+ * - The install path is always explicit (issue #70, see installerPathArgs).
+ * - The platform version is forwarded only when one was requested; the
+ *   installer auto-picks the newest TIZEN-X.Y otherwise and rejects a
+ *   version the repository does not offer. `version` MUST already have
+ *   passed validateTizenVersion(): it is spliced into a double-quoted shell
+ *   argument and that regex is what keeps it inert. The bash script accepts
+ *   both `--platform <v>` and `--platform=<v>`; the space form is used here.
+ * - --download-jobs is normalised (1-8) and always present.
+ *
+ * Both installSdk() branches (pkg binary → execPluginScript, non-pkg →
+ * suggested_fix / background_command) join these same arrays, so the two
+ * command lines cannot drift apart.
+ *
+ * @param {{sdkPath: string, version?: string, force?: boolean, downloadJobs?: number|string}} o
+ * @returns {{win: string[], unix: string[]}}
+ */
+function sdkInstallerFlags({
+  sdkPath,
+  version = "",
+  force = false,
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+}) {
+  if (version && !TIZEN_VERSION_RE.test(version)) {
+    // Defence in depth: every caller validates first; refuse to build a
+    // command line around a value that somehow did not go through it.
+    throw new Error(
+      `sdkInstallerFlags: version "${version}" did not pass validateTizenVersion()`,
+    );
+  }
+  const pathArgs = installerPathArgs(sdkPath);
+  const win = [pathArgs.win];
+  const unix = [pathArgs.unix];
+  if (version) {
+    win.push(`-Platform "${version}"`);
+    unix.push(`--platform "${version}"`);
+  }
+  if (force) {
+    win.push("-Force");
+    unix.push("--force");
+  }
+  const jobsFlags = downloadJobsFlags(downloadJobs);
+  win.push(jobsFlags.win);
+  unix.push(jobsFlags.unix);
+  return { win, unix };
+}
+
+function installerFix(
+  group,
+  scriptPath,
+  winArgs = "",
+  unixArgs = "",
+  notFound,
+) {
+  if (!scriptPath) {
+    return { command: notFound || `Installer script not found: ${group}` };
+  }
+  return {
+    command: buildScriptCommand(scriptPath, winArgs, unixArgs),
+    background_command: buildJobCommand(group, winArgs, unixArgs),
+  };
+}
+
+/**
+ * How an SDK pre-check tells the agent to re-run it once the background install
+ * finished. The re-run repeats this run's arguments — the version (and label),
+ * and for a custom repository the URL — so the already-installed branch still
+ * checks that the requested platform went in (requestedPlatformMissing), and
+ * drops --force, which skips the already-installed check and would hand back
+ * the installer command again. A bare re-run lost the version: a requested
+ * 10.0 that never got installed was then reported as a completed install.
+ *
+ * @param {string} verify - what the re-run confirms
+ * @param {{customRepo?: boolean}} [opts]
+ * @returns {string} one sentence ending with a trailing space
+ */
+function sdkPrecheckRerunHint(verify, { customRepo = false } = {}) {
+  const same = customRepo
+    ? "the same repository URL and version"
+    : "the same version (and label)";
+  return `Either way, afterwards re-run this CLI with ${same} as this run but without --force, to verify ${verify}. `;
+}
+
+/**
+ * The per-harness instructions every Phase-1 pre-check puts in its "not
+ * installed" message. One source so the Codex clause cannot drift between the
+ * eight installers.
+ *
+ * @param {"detach"|"foreground"} clineMode - what Cline should do with the
+ *   script: use its own --detach/--status (the two SDK installers implement
+ *   them) or run it in the foreground (the other installers).
+ * @returns {string} sentence(s) ending with a trailing space
+ */
+function harnessGuidance(clineMode) {
+  const cline =
+    clineMode === "foreground"
+      ? "Cline / harnesses WITHOUT background completion notification — run in FOREGROUND " +
+        "(Cline's execute_command has no 10-min timeout and streams progress logs). " +
+        "Do NOT background it: no Start-Process, no start /b, no trailing &. "
+      : // One fragment per clause, every fragment ending in the space that
+        // separates it from the next; harness-guidance.test.js compares the
+        // assembled Cline clause with the expected text character for character.
+        "Cline / harnesses WITHOUT background completion notification — use --detach (Linux/macOS) or -Detach (Windows) to launch a detached process, " +
+        "then poll --status / -Status after a 25 s sleep (execute_command times out at 30 s), " +
+        "putting an increasing attempt number in every poll command (e.g. echo 'poll #N') so no two calls are identical — Cline aborts after 5 consecutive identical tool calls — " +
+        "and at most 4 polls per turn: still STATUS=running after that, tell the user that the install keeps running in the background, " +
+        "that no automatic completion notice will come (Cline cannot notify them when the install finishes) so when they want to know whether it finished they have to ask (e.g. 'tell me the install progress'), and give them the --status / -Status command for checking by hand; " +
+        "then END YOUR TURN and, when they ask, run --status / -Status and continue from there, until STATUS=done. " +
+        "Do NOT use run_in_background (10-min timeout kills the process). Do NOT run in foreground (the package log floods the context window). ";
+  return (
+    "Run the suggested_fix command per your harness: " +
+    "Claude Code — Bash tool with run_in_background: true, END YOUR TURN, resume on <task-notification>. " +
+    cline +
+    "Codex CLI — one exec call waits at most 30 s, so do NOT run suggested_fix.command; run " +
+    "suggested_fix.background_command instead (it detaches the same script as a job and returns a " +
+    "job_id within a second; request escalated permissions — it downloads, and the default sandbox " +
+    "sets CODEX_SANDBOX_NETWORK_DISABLED=1; inside the sandbox it is refused with sandbox_blocked, " +
+    "guard rule 12), then poll node <same lib/cli dir>/job-cli.js wait " +
+    "--id <job_id> (each call blocks at most 25 s) until job.state is done. "
+  );
+}
+
+/**
+ * Return currently configured SDK path or use default
+ *
+ * @returns {string} SDK path (configured value or default ~/tizen-sdk)
+ */
+function readSdkPath() {
+  try {
+    let resolved = null;
+    if (fs.existsSync(CONFIG_FILE)) {
+      const sdkPath = fs.readFileSync(CONFIG_FILE, "utf-8").trim();
+      if (sdkPath) resolved = sdkPath;
+    }
+    if (!resolved) {
+      console.error(`[tizen-sdk] Using default SDK path: ${DEFAULT_SDK_PATH}`);
+      resolved = DEFAULT_SDK_PATH;
+    }
+    // TIZEN_SDK_PATH is deliberately NOT a source here: the config file written
+    // by sdk-init is the one place every layer agrees on. Say so when the env
+    // var disagrees, so a stale ~/tizen-studio export is visible (issue #70).
+    const envPath = (process.env.TIZEN_SDK_PATH || "").trim();
+    if (envPath && path.resolve(envPath) !== path.resolve(resolved)) {
+      console.error(
+        `[tizen-sdk] Ignoring TIZEN_SDK_PATH=${envPath}; the SDK path comes from ${CONFIG_FILE} (${resolved}). ` +
+          "Run tizen-sdk-init to change it.",
+      );
+    }
+    return resolved;
+  } catch (_error) {
+    console.error(
+      `[tizen-sdk] Error reading config, using default: ${DEFAULT_SDK_PATH}`,
+    );
+    return DEFAULT_SDK_PATH;
+  }
+}
+
+/**
+ * Check SDK installation status (local)
+ *
+ * sdk.info is a completion marker created only when the installer script succeeds fully —
+ * the existence of this file means "installation complete".
+ *
+ * @param {string} sdkPath - SDK path
+ * @returns {{installed: boolean, sdkPath: string|null, sdkInfoPath: string|null, message: string}}
+ */
+function checkSdkInstallStatus(sdkPath) {
+  try {
+    if (!sdkPath) {
+      return {
+        installed: false,
+        sdkPath: null,
+        sdkInfoPath: null,
+        message: "SDK path not configured",
+      };
+    }
+
+    const sdkInfoPath = path.join(sdkPath, "sdk.info");
+    const installed = fs.existsSync(sdkInfoPath);
+
+    return {
+      installed,
+      sdkPath,
+      sdkInfoPath,
+      message: installed
+        ? "SDK is already installed (sdk.info found)"
+        : "SDK is not installed (sdk.info not found)",
+    };
+  } catch (error) {
+    return {
+      installed: false,
+      sdkPath: null,
+      sdkInfoPath: null,
+      message: `Error checking SDK status: ${error.message}`,
+    };
+  }
+}
+
+/**
+ * Make an existing `<sdkPath>/sdk.info` parseable by Tizen CLI.
+ *
+ * Tizen CLI's tpklib `PropertyParser.getKey()` is `line.substring(0,
+ * line.indexOf("="))` with no comment/blank-line handling, so any line without
+ * "=" throws StringIndexOutOfBoundsException(-1) inside SDKConstants.<clinit>
+ * and the whole command dies — most visibly `tizen package -t rpk`
+ * ("[ERROR] RPK package failed"). A UTF-8 BOM breaks it more quietly: the first
+ * key becomes "<U+FEFF>TIZEN_SDK_INSTALLED_PATH" and is never found.
+ *
+ * Installers up to 1.1.1 wrote exactly that: a "# Tizen SDK Configuration"
+ * header, and on Windows PowerShell 5.1 a BOM (`Set-Content -Encoding UTF8`).
+ * New installs are clean, but every SDK installed earlier still carries the
+ * bad file, so the runners that hand the SDK to Tizen CLI call this first.
+ *
+ * Rewrites the file only when it has to (BOM, or a line that is blank or has
+ * no "="), keeping KEY=VALUE lines verbatim — including "#" inside a value —
+ * and the file's own line-ending style. Never throws.
+ *
+ * @param {string} sdkPath - SDK root (the directory holding sdk.info)
+ * @returns {{path: string|null, repaired: boolean, bom_removed: boolean,
+ *   removed_lines: string[], error: string|null}}
+ */
+function repairSdkInfo(sdkPath) {
+  const result = {
+    path: null,
+    repaired: false,
+    bom_removed: false,
+    removed_lines: [],
+    error: null,
+  };
+  try {
+    if (!sdkPath) return result;
+    const sdkInfoPath = path.join(sdkPath, "sdk.info");
+    result.path = sdkInfoPath;
+    if (!fs.existsSync(sdkInfoPath)) return result;
+
+    let text = fs.readFileSync(sdkInfoPath, "utf-8");
+    if (text.charCodeAt(0) === 0xfeff) {
+      text = text.slice(1);
+      result.bom_removed = true;
+    }
+
+    const eol = text.includes("\r\n") ? "\r\n" : "\n";
+    const lines = text.split(/\r?\n/);
+    // The final newline yields one empty tail element; that is not a line.
+    if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const kept = [];
+    for (const line of lines) {
+      (line.includes("=") ? kept : result.removed_lines).push(line);
+    }
+    if (!result.bom_removed && result.removed_lines.length === 0) return result;
+
+    fs.writeFileSync(sdkInfoPath, kept.join(eol) + eol, "utf-8");
+    result.repaired = true;
+    console.error(
+      `[tizen-sdk] Repaired ${sdkInfoPath} for Tizen CLI` +
+        (result.bom_removed ? " (removed UTF-8 BOM)" : "") +
+        (result.removed_lines.length > 0
+          ? ` (dropped ${result.removed_lines.length} comment/blank line(s))`
+          : ""),
+    );
+    return result;
+  } catch (error) {
+    result.error = error.message;
+    return result;
+  }
+}
+
+/**
+ * Human-readable one-liner for a repairSdkInfo() result, or null when nothing
+ * happened. Callers append it to the envelope's warnings so the user learns
+ * that a file under their SDK was rewritten and why.
+ *
+ * @param {ReturnType<typeof repairSdkInfo>} repair
+ * @returns {string|null}
+ */
+function describeSdkInfoRepair(repair) {
+  if (!repair) return null;
+  if (repair.error) {
+    return `sdk.info at ${repair.path} could not be checked for Tizen CLI compatibility: ${repair.error}`;
+  }
+  if (!repair.repaired) return null;
+  const parts = [];
+  if (repair.bom_removed) parts.push("a UTF-8 BOM");
+  if (repair.removed_lines.length > 0) {
+    parts.push(
+      `${repair.removed_lines.length} comment/blank line(s) (e.g. ${JSON.stringify(repair.removed_lines[0])})`,
+    );
+  }
+  return (
+    `Repaired ${repair.path}: removed ${parts.join(" and ")}. ` +
+    "Tizen CLI reads sdk.info as strict KEY=VALUE lines and crashes on anything else " +
+    "(StringIndexOutOfBoundsException in PropertyParser.getKey, e.g. during RPK packaging)."
+  );
+}
+
+/**
+ * Check SDK installation status via script check mode
+ *
+ * Query the installer script itself: Windows `-Check`, Linux/macOS `--check`.
+ *
+ * @param {string} sdkPath - SDK path
+ * @returns {{status: string, exitCode: number, message: string, alreadyInstalled: boolean}}
+ */
+async function checkSdkInstallationViaScript(sdkPath) {
+  try {
+    if (!sdkPath) {
+      return {
+        status: "error",
+        exitCode: 1,
+        message: "SDK path is required",
+        alreadyInstalled: false,
+      };
+    }
+
+    console.error(
+      `[tizen-sdk] Checking SDK installation status at ${sdkPath}...`,
+    );
+
+    const resolved = resolveScript("tizen-sdk-install");
+    if (resolved.error) {
+      return {
+        status: "error",
+        exitCode: 1,
+        message: resolved.error,
+        alreadyInstalled: false,
+      };
+    }
+
+    let output;
+    try {
+      output = execPluginScript(
+        resolved.scriptPath,
+        `-Check -SdkPath "${sdkPath}"`,
+        `--check --sdk-path="${sdkPath}"`,
+      );
+    } catch (error) {
+      const errOutput = error.stderr || error.message;
+
+      // Even if check mode exits abnormally, if output contains install signal, consider it installed
+      if (
+        errOutput.includes("already installed") ||
+        errOutput.includes("sdk.info")
+      ) {
+        return {
+          status: "done",
+          exitCode: 0,
+          message: "SDK is already installed",
+          alreadyInstalled: true,
+        };
+      }
+
+      return {
+        status: "error",
+        exitCode: error.status || 1,
+        message: `Check mode failed: ${errOutput}`,
+        alreadyInstalled: false,
+      };
+    }
+
+    console.error(`[tizen-sdk] Check mode output: ${output}`);
+
+    if (output.includes("already installed") || output.includes("sdk.info")) {
+      return {
+        status: "done",
+        exitCode: 0,
+        message: "SDK is already installed",
+        alreadyInstalled: true,
+      };
+    }
+
+    return {
+      status: "done",
+      exitCode: 0,
+      message: "SDK is not yet installed. Ready to install.",
+      alreadyInstalled: false,
+    };
+  } catch (error) {
+    return {
+      status: "error",
+      exitCode: 1,
+      message: `Check mode error: ${error.message}`,
+      alreadyInstalled: false,
+    };
+  }
+}
+
+/**
+ * Pre-installation status check (3 stages)
+ *
+ * Stage 1: local sdk.info check (fast, skip stage 2 if found)
+ * Stage 2: run script check mode
+ * Stage 3: make decision
+ *
+ * @param {string} sdkPath - SDK path
+ * @param {boolean} force - if true, proceed even if already installed
+ * @returns {{alreadyInstalled: boolean, shouldProceed: boolean, reason: string}}
+ */
+async function checkIfSdkAlreadyInstalled(sdkPath, force = false) {
+  try {
+    // Stage 1: local sdk.info check
+    const localStatus = checkSdkInstallStatus(sdkPath);
+
+    if (localStatus.installed && !force) {
+      console.error("[tizen-sdk] SDK is already installed (sdk.info found)");
+      return {
+        alreadyInstalled: true,
+        shouldProceed: false,
+        reason: "SDK is already installed. Use -Force/--force to reinstall.",
+      };
+    }
+
+    // Stage 2: script check mode
+    const checkResult = await checkSdkInstallationViaScript(sdkPath);
+
+    if (checkResult.alreadyInstalled && !force) {
+      console.error("[tizen-sdk] SDK is already installed (via check mode)");
+      return {
+        alreadyInstalled: true,
+        shouldProceed: false,
+        reason: "SDK is already installed. Use -Force/--force to reinstall.",
+      };
+    }
+
+    // Stage 3: proceed
+    return {
+      alreadyInstalled: false,
+      shouldProceed: true,
+      reason: "SDK is not installed. Ready to proceed.",
+    };
+  } catch (error) {
+    return {
+      alreadyInstalled: false,
+      shouldProceed: true,
+      reason: `Error checking status: ${error.message}. Proceeding with installation.`,
+    };
+  }
+}
+
+/**
+ * TV SDK extension package installation pre-check (Phase 1)
+ *
+ * TV SDK is an extension package (TV-SAMSUNG-Public) of Tizen SDK, so Tizen SDK
+ * must already be installed. This function performs pre-check only, not actual installation.
+ *
+ * Flow:
+ * 1. Check if Tizen SDK is installed (sdk.info) — abort with interactive guidance if not
+ * 2. Check if TV SDK is already installed (.tv-sdk-installed marker)
+ * 3. Return TV SDK installer command (suggested_fix) — agent executes in Phase 2 background
+ *
+ * @param {boolean} force - force reinstall (default: false)
+ * @returns {object} Standard JSON Envelope
+ */
+async function installTvSdk(
+  force = false,
+  command = "tizen-sdk tv-sdk-install",
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  const startTime = Date.now();
+  try {
+    // 1. Check if Tizen SDK is installed
+    const sdkPath = readSdkPath();
+    console.error("[tizen-tv-sdk] Checking if Tizen SDK is installed...");
+
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      console.error(
+        "[tizen-tv-sdk] Tizen SDK is NOT installed. Aborting TV SDK installation.",
+      );
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is not installed. TV SDK is an extension that requires Tizen SDK to be installed first. " +
+          "Please install Tizen SDK first (use the tizen-sdk-install skill), then retry TV SDK installation. " +
+          'Ask the user: "Tizen SDK가 먼저 설치되어야 합니다. Tizen SDK 설치를 진행하시겠습니까?" ' +
+          "If the user approves, run the tizen-sdk-install skill, then retry TV SDK installation. " +
+          "If the user declines, abort.",
+        null,
+        startTime,
+      );
+    }
+    console.error(`[tizen-tv-sdk] Tizen SDK found at ${sdkPath}. Continuing.`);
+
+    // 2. Check if TV SDK is already installed: the online repository carries
+    // one TV version, so any tv-sdk-install record (or the marker an older
+    // online install left without a record) means it is in.
+    const onlineTv = onlineTvInstalled(sdkPath);
+    if (onlineTv.length > 0 && !force) {
+      console.error(
+        "[tizen-tv-sdk] TV SDK is already installed (recorded in .platform-installed).",
+      );
+      const warnings = [
+        `TV SDK installation verified at ${sdkPath} (TV ${onlineTv.map((p) => p.version).join(", ")} recorded in .platform-installed). To force a reinstall, run with --force.`,
+      ];
+      return formatTvSdkInstall(onlineTv, warnings, startTime, command);
+    }
+
+    // 3. Resolve TV SDK installer script
+    const installer = resolveScript("tizen-tv-sdk-install");
+
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // In pkg-compiled binary (tizen-cli), execute the installer directly.
+    // In Claude Code / Cline (non-pkg), return the installer command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    if (isPkg) {
+      // Direct execution: run TV SDK installer script synchronously
+      console.error(
+        `[tizen-tv-sdk] Running installer: ${installer.scriptPath}`,
+      );
+      try {
+        const jobsFlags = downloadJobsFlags(downloadJobs);
+        const winArgs = `-SdkPath "${sdkPath}"${force ? " -Force" : ""} ${jobsFlags.win}`;
+        const unixArgs = `--sdk-path="${sdkPath}"${force ? " --force" : ""} ${jobsFlags.unix}`;
+        execPluginScript(installer.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-tv-sdk] Installer completed.");
+
+        // Verify installation: the installer records the TV version it put in
+        const packages = onlineTvInstalled(sdkPath);
+        if (packages.length > 0) {
+          console.error(
+            "[tizen-tv-sdk] TV SDK installation verified (recorded in .platform-installed).",
+          );
+          const warnings = [`TV SDK installed successfully at ${sdkPath}.`];
+          return formatTvSdkInstall(packages, warnings, startTime, command);
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but no TV install is recorded in ${platformRecordPath(sdkPath)}. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "TV SDK installation",
+          sdkPath,
+          logGroup: "tv-sdk-install",
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): return installer command as suggested_fix
+      const installerCommand = installerFix(
+        "tizen-tv-sdk-install",
+        installer.scriptPath,
+        `-SdkPath "${sdkPath.replace(/\\/g, "/")}"${force ? " -Force" : ""}`,
+        `--sdk-path="${sdkPath}"${force ? " --force" : ""}`,
+        `Installer script not found: ${installer.error}`,
+      );
+
+      return formatError(
+        command,
+        "install_required",
+        "TV SDK is NOT installed. This pre-check CLI cannot install it. " +
+          harnessGuidance("detach") +
+          "Either way, afterwards re-run this CLI to verify the TV version is recorded in <sdk-path>/.platform-installed. " +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install TV SDK: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Package update pre-check (Phase 1)
+ *
+ * Checks for available updates to installed Tizen SDK packages.
+ * Downloads the latest pkg_list, compares versions with installed manifests,
+ * and either:
+ *   - In pkg-compiled binary: executes the update script directly
+ *   - In Claude Code / Cline: returns the update command as suggested_fix
+ *     for the agent to run in background (Phase 2)
+ *
+ * Flow:
+ * 1. Check if Tizen SDK is installed (sdk.info) — abort if not
+ * 2. Resolve the update-package script
+ * 3. If a fresh .package-update-result marker (written by the Phase 2 script)
+ *    matches this request, return that run's success/failure envelope
+ * 4. Otherwise return update command (suggested_fix) — agent executes in Phase 2 background
+ *
+ * @param {boolean} force - force update all installed packages regardless of version (default: false)
+ * @param {boolean} dryRun - list outdated packages without updating (default: false)
+ * @returns {object} Standard JSON Envelope
+ */
+async function updatePackage(
+  force = false,
+  dryRun = false,
+  command = "tizen-sdk update-package",
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  const startTime = Date.now();
+  try {
+    // 1. Check if Tizen SDK is installed
+    const sdkPath = readSdkPath();
+    console.error(
+      "[tizen-update-package] Checking if Tizen SDK is installed...",
+    );
+
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      console.error(
+        "[tizen-update-package] Tizen SDK is NOT installed. Aborting package update.",
+      );
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is not installed. Package update requires Tizen SDK to be installed first. " +
+          "Please install Tizen SDK first (use the tizen-sdk-install skill), then retry package update.",
+        null,
+        startTime,
+      );
+    }
+    console.error(
+      `[tizen-update-package] Tizen SDK found at ${sdkPath}. Continuing.`,
+    );
+
+    // 2. Resolve update-package script
+    const updater = resolveScript("tizen-update-package");
+
+    if (!updater.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Update script not found: ${updater.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // In pkg-compiled binary (tizen-cli), execute the updater directly.
+    // In Claude Code / Cline (non-pkg), return the updater command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    const winFlags = [];
+    const unixFlags = [];
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+    if (dryRun) {
+      winFlags.push("-DryRun");
+      unixFlags.push("--dry-run");
+    }
+    const jobsFlags = downloadJobsFlags(downloadJobs);
+    winFlags.push(jobsFlags.win);
+    unixFlags.push(jobsFlags.unix);
+    const winFlagStr = winFlags.length > 0 ? " " + winFlags.join(" ") : "";
+    const unixFlagStr = unixFlags.length > 0 ? " " + unixFlags.join(" ") : "";
+
+    if (isPkg) {
+      // Direct execution: run update script synchronously
+      console.error(
+        `[tizen-update-package] Running updater: ${updater.scriptPath}`,
+      );
+      try {
+        const winArgs = `-SdkPath "${sdkPath}"${winFlagStr}`;
+        const unixArgs = `--sdk-path="${sdkPath}"${unixFlagStr}`;
+
+        const output = execPluginScript(updater.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-update-package] Updater completed.");
+
+        // Parse output for summary and per-package detail.
+        //
+        // Two line shapes carry the package-level data:
+        //   dry-run listing:  "    3. PkgName                                   1.0 -> 1.1"
+        //   real update:      "[OK] [3/124] PkgName updated: 1.0 -> 1.1"
+        // Neither regex matching is fatal if the script's wording ever drifts —
+        // `packages` just stays [] like it always used to, so this only adds
+        // detail, it never removes the summary counts callers already relied on.
+        const packages = [];
+        for (const m of output.matchAll(
+          /^\s*\d+\.\s+(\S+)\s+(\S+)\s*->\s*(\S+)\s*$/gm,
+        )) {
+          packages.push({
+            name: m[1],
+            status: "outdated",
+            installed_version: m[2],
+            available_version: m[3],
+          });
+        }
+        for (const m of output.matchAll(
+          /^\[OK\]\s+\[\d+\/\d+\]\s+(\S+)\s+updated:\s+(\S+)\s*->\s*(\S+)\s*$/gm,
+        )) {
+          packages.push({
+            name: m[1],
+            status: "updated",
+            installed_version: m[2],
+            available_version: m[3],
+          });
+        }
+
+        let summary = {
+          total: 0,
+          updated: 0,
+          skipped: 0,
+          failed: 0,
+          up_to_date: 0,
+        };
+
+        // Try to parse the script output for structured data
+        // The script outputs lines like: [OK] Update result: updated X / skipped Y / failed Z / up-to-date W (total N)
+        const summaryMatch = output.match(
+          /updated\s+(\d+)\s*\/\s*skipped\s+(\d+)\s*\/\s*failed\s+(\d+)\s*\/\s*up-to-date\s+(\d+)\s*\(total\s+(\d+)\)/i,
+        );
+        if (summaryMatch) {
+          summary = {
+            updated: parseInt(summaryMatch[1], 10),
+            skipped: parseInt(summaryMatch[2], 10),
+            failed: parseInt(summaryMatch[3], 10),
+            up_to_date: parseInt(summaryMatch[4], 10),
+            total: parseInt(summaryMatch[5], 10),
+          };
+        }
+
+        const warnings = [];
+        if (summary.failed > 0) {
+          warnings.push(
+            `${summary.failed} package(s) failed to update. Check the script output for details.`,
+          );
+        }
+        if (summary.updated > 0) {
+          warnings.push(`${summary.updated} package(s) updated successfully.`);
+        } else if (dryRun) {
+          warnings.push("Dry-run mode: no packages were actually updated.");
+        } else {
+          warnings.push("All installed packages are up-to-date.");
+        }
+
+        return formatPackageUpdate(
+          packages,
+          summary,
+          warnings,
+          startTime,
+          command,
+        );
+      } catch (updateError) {
+        const errOutput =
+          updateError.stdout || updateError.stderr || updateError.message;
+        return formatError(
+          command,
+          "execution_error",
+          `Package update failed: ${errOutput}`,
+          null,
+          startTime,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex). The Phase 2 script leaves
+      // .package-update-result behind when it finishes; the agent's re-run of
+      // this CLI turns that into the real success/failure envelope instead of
+      // handing back the launcher envelope a second time.
+      const markerPath = path.join(sdkPath, UPDATE_RESULT_MARKER);
+      let staleNote = "";
+      if (fs.existsSync(markerPath)) {
+        const marker = parseUpdateResultMarker(
+          fs.readFileSync(markerPath, "utf-8"),
+        );
+        if (
+          marker.summary &&
+          updateResultSatisfies(marker.mode, { force, dryRun })
+        ) {
+          if (isUpdateResultFresh(fs.statSync(markerPath).mtimeMs)) {
+            console.error(
+              `[tizen-update-package] Phase 2 result found at ${markerPath} (mode ${marker.mode}, exit ${marker.exit_code}).`,
+            );
+            const s = marker.summary;
+            const verified = `Verified from ${markerPath} (Phase 2 finished at ${marker.finished_at}, mode ${marker.mode}).`;
+            if (marker.exit_code !== 0 || s.failed > 0) {
+              return formatError(
+                command,
+                "execution_error",
+                `Package update finished with failures: ${s.failed} package(s) failed to update ` +
+                  `(updated ${s.updated} / skipped ${s.skipped} / up-to-date ${s.up_to_date} / total ${s.total}). ` +
+                  "Read the Phase 2 log for the failing packages, fix the cause (network, disk space, mirror), and run the update again. " +
+                  verified,
+                null,
+                startTime,
+              );
+            }
+            const warnings = [];
+            if (s.updated > 0) {
+              warnings.push(`${s.updated} package(s) updated successfully.`);
+            } else if (marker.mode === "dry-run") {
+              warnings.push(
+                s.outdated > 0
+                  ? `Dry-run mode: ${s.outdated} package(s) have updates available; nothing was changed.`
+                  : "Dry-run mode: all installed packages are up-to-date; nothing was changed.",
+              );
+            } else {
+              warnings.push("All installed packages are up-to-date.");
+            }
+            warnings.push(verified);
+            return formatPackageUpdate([], s, warnings, startTime, command);
+          }
+          staleNote =
+            `A previous run finished at ${marker.finished_at} (mode ${marker.mode}: ` +
+            `updated ${marker.summary.updated} / failed ${marker.summary.failed} / up-to-date ${marker.summary.up_to_date}) ` +
+            `but is older than ${UPDATE_RESULT_MAX_AGE_MS / 60000} minutes, so it is not used as verification. `;
+        }
+      }
+
+      const updaterCommand = installerFix(
+        "tizen-update-package",
+        updater.scriptPath,
+        `-SdkPath "${sdkPath.replace(/\\/g, "/")}"${winFlagStr}`,
+        `--sdk-path="${sdkPath}"${unixFlagStr}`,
+      );
+
+      return formatError(
+        command,
+        "execution_error",
+        "SDK found. Phase 1 is a launcher—it cannot check for updates directly. " +
+          "Run the Phase 2 update script (in suggested_fix) to check for available updates. " +
+          "This is the normal two-phase workflow, not an error. " +
+          staleNote +
+          harnessGuidance("detach") +
+          `After Phase 2 completes, re-run this CLI within ${UPDATE_RESULT_MAX_AGE_MS / 60000} minutes: ` +
+          `it reads <sdk-path>/${UPDATE_RESULT_MARKER}, which the updater writes on exit, and returns the real success/failure envelope. ` +
+          (dryRun
+            ? "Dry-run mode: Phase 2 will list outdated packages without updating. "
+            : "") +
+          (force
+            ? "Force mode: Phase 2 will re-download and re-install all installed packages. "
+            : ""),
+        updaterCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to update packages: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+const UPDATE_RESULT_MARKER = ".package-update-result";
+// How long a finished Phase 2 run still counts as verification for a Phase 1
+// re-run. Unlike the install markers, "up to date" decays with time, so the
+// window is short: long enough for the agent's notify → re-run hop, too short
+// to answer next week's request with last week's result.
+const UPDATE_RESULT_MAX_AGE_MS = 30 * 60 * 1000;
+
+/**
+ * Parse a .package-update-result marker written by tizen-update-package.sh/.ps1.
+ *
+ * Marker shape (one field per line, CRLF tolerated):
+ *   Package update finished at 2026-09-09T05:10:00-04:00
+ *   Mode: update | force | dry-run
+ *   Exit: 0 | 1
+ *   Outdated: 3
+ *   Result: updated 3 / skipped 0 / failed 0 / up-to-date 120 (total 123)
+ *
+ * Missing or malformed fields yield null rather than throwing — the caller
+ * treats a marker without a summary as absent.
+ *
+ * Exported for unit testing.
+ *
+ * @param {string} markerBody - marker file content
+ * @returns {{finished_at: string|null, mode: string|null, exit_code: number|null, summary: object|null}}
+ */
+function parseUpdateResultMarker(markerBody) {
+  const text = String(markerBody || "");
+  const grab = (re) => {
+    const m = text.match(re);
+    return m ? m[1].trim() : null;
+  };
+  const exitRaw = grab(/^Exit:[ \t]*(\d+)[ \t]*\r?$/m);
+  const outdatedRaw = grab(/^Outdated:[ \t]*(\d+)[ \t]*\r?$/m);
+  const summaryMatch = text.match(
+    /updated\s+(\d+)\s*\/\s*skipped\s+(\d+)\s*\/\s*failed\s+(\d+)\s*\/\s*up-to-date\s+(\d+)\s*\(total\s+(\d+)\)/i,
+  );
+  let summary = null;
+  if (summaryMatch) {
+    summary = {
+      total: parseInt(summaryMatch[5], 10),
+      updated: parseInt(summaryMatch[1], 10),
+      skipped: parseInt(summaryMatch[2], 10),
+      failed: parseInt(summaryMatch[3], 10),
+      up_to_date: parseInt(summaryMatch[4], 10),
+    };
+    if (outdatedRaw !== null) summary.outdated = parseInt(outdatedRaw, 10);
+  }
+  return {
+    finished_at: grab(/^Package update finished at[ \t]*(\S+)[ \t]*\r?$/m),
+    mode: grab(/^Mode:[ \t]*(\S+)[ \t]*\r?$/m),
+    exit_code: exitRaw === null ? null : parseInt(exitRaw, 10),
+    summary,
+  };
+}
+
+/**
+ * Is a marker with this mtime recent enough to stand in for a fresh check?
+ * A slightly future mtime (clock skew) counts as fresh; NaN never does.
+ *
+ * Exported for unit testing.
+ */
+function isUpdateResultFresh(
+  mtimeMs,
+  nowMs = Date.now(),
+  maxAgeMs = UPDATE_RESULT_MAX_AGE_MS,
+) {
+  const age = nowMs - mtimeMs;
+  return Number.isFinite(age) && age <= maxAgeMs;
+}
+
+/**
+ * Can a run recorded with `markerMode` answer this request?
+ *
+ * A plain request is answered by any real update (plain or forced). --force
+ * and --dry-run are answered only by a run of the same kind, so `--force`
+ * right after a plain update still launches Phase 2 instead of reporting the
+ * plain run's "up-to-date".
+ *
+ * Exported for unit testing.
+ */
+function updateResultSatisfies(
+  markerMode,
+  { force = false, dryRun = false } = {},
+) {
+  if (dryRun) return markerMode === "dry-run";
+  if (force) return markerMode === "force";
+  return markerMode === "update" || markerMode === "force";
+}
+
+/**
+ * SDK repository information query
+ *
+ * Returns metadata about known Tizen SDK package repositories (official CDN and
+ * its regional mirrors) and the currently configured repository (from
+ * {SDK_PATH}/.package/repository.info, if available).
+ *
+ * This is a read-only information query — it does not install or modify anything.
+ *
+ * @returns {object} Standard JSON Envelope
+ */
+async function getRepoInfo(command = "tizen-sdk sdk-repo-info") {
+  const startTime = Date.now();
+  try {
+    // Static repository metadata
+    const repositories = [
+      {
+        url: "https://download.tizen.org/sdk/tizenstudio/official/",
+        name: "Official CDN",
+        type: "public",
+        description:
+          "Tizen official CDN repository. The default mirror selected by timezone-based auto-selection.",
+        access: "Internet (public)",
+        mirrors: [
+          "https://usa.sdk-dl.tizen.org/sdk/tizenstudio/official",
+          "https://brazil.sdk-dl.tizen.org/sdk/tizenstudio/official",
+          "https://singapore.sdk-dl.tizen.org/sdk/tizenstudio/official",
+        ],
+      },
+    ];
+    // Private / in-house mirrors are not listed here: pass them explicitly via
+    // `--repo-url <url>` (tizen-sdk-install-custom-repo). The URL must serve
+    // pkg_list_{OS}-64 or pkg_list_{OS}-32 at its root.
+
+    // Try to read current repository from repository.info
+    let currentRepo = null;
+    const sdkPath = readSdkPath();
+    const repoInfoPath = path.join(sdkPath, ".package", "repository.info");
+
+    if (fs.existsSync(repoInfoPath)) {
+      try {
+        const content = fs.readFileSync(repoInfoPath, "utf-8");
+        const match = content.match(/^Repository=(.+)$/m);
+        if (match) {
+          currentRepo = match[1].trim();
+        }
+      } catch (e) {
+        console.error(
+          `[tizen-sdk] Could not read repository.info: ${e.message}`,
+        );
+      }
+    }
+
+    const warnings = [];
+    if (!currentRepo) {
+      warnings.push(
+        "repository.info not found — SDK may not be installed yet, or the SDK was installed before the repository.info feature was added.",
+      );
+    }
+
+    return formatRepoInfo(
+      currentRepo,
+      repositories,
+      startTime,
+      warnings,
+      command,
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to get repository info: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Trim whitespace and trailing slashes from a repository URL so that
+ * `${url}/pkg_list_...` never produces a double slash (some servers 404 on it).
+ *
+ * @param {string} url
+ * @returns {string}
+ */
+function normalizeRepoUrl(url) {
+  if (typeof url !== "string") return "";
+  return url.trim().replace(/\/+$/, "");
+}
+
+/**
+ * Syntactic checks on a custom repository URL (no network access).
+ *
+ * Split out from validateRepoUrl so an obviously-bad URL fails instantly with a
+ * precise message instead of spending a network round trip on it.
+ *
+ * @param {string} repoUrl
+ * @returns {{ok: true, url: string}|{ok: false, message: string}}
+ */
+function checkRepoUrlSyntax(repoUrl) {
+  if (!repoUrl || typeof repoUrl !== "string" || !repoUrl.trim()) {
+    return {
+      ok: false,
+      message:
+        "Repository URL is required. Pass the base URL of the package repository " +
+        "(the directory that contains pkg_list_{OS}-{64,32}).",
+    };
+  }
+
+  const url = normalizeRepoUrl(repoUrl);
+
+  if (!/^https?:\/\//i.test(url)) {
+    return {
+      ok: false,
+      message: `Repository URL must start with http:// or https:// — got: ${url}`,
+    };
+  }
+
+  try {
+    const parsed = new URL(url);
+    if (!parsed.host) {
+      return { ok: false, message: `Repository URL has no host: ${url}` };
+    }
+  } catch (_e) {
+    return { ok: false, message: `Malformed repository URL: ${url}` };
+  }
+
+  if (/\/pkg_list_[^/]*$/i.test(url)) {
+    return {
+      ok: false,
+      message:
+        `Repository URL must point at the DIRECTORY containing the package list, ` +
+        `not at the pkg_list file itself: ${url}. ` +
+        `Drop the trailing "/pkg_list_..." segment.`,
+    };
+  }
+
+  return { ok: true, url };
+}
+
+/**
+ * Validate a custom package repository URL.
+ *
+ * A URL is a usable Tizen package repository only if it serves the package
+ * index file `pkg_list_{OS}-{64,32}` for the current OS
+ * (OS = windows | ubuntu | macos) at its root — that file is what the whole
+ * install is driven from. Anything else is rejected here, before ~100 package
+ * downloads fail and leave a half-installed SDK behind.
+ *
+ * The reachability probe is delegated to the installer script's
+ * `--validate-repo-url` / `-ValidateRepoUrl` mode (curl / HttpWebRequest) rather
+ * than re-implemented here, so it honours the machine's proxy and certificate
+ * configuration — internal mirrors usually need both — and so script and
+ * pre-check can never disagree on what counts as valid.
+ *
+ * @param {string} repoUrl - repository base URL
+ * @param {string} [command] - envelope command name (overridden by callers that
+ *   validate as one step of a larger command, e.g. install-custom-repo)
+ * @returns {object} Standard JSON Envelope
+ *   - success: result.valid = true, result.pkg_list_file, result.pkg_list_url
+ *   - failure: repo_url_invalid (malformed) or repo_url_unreachable (no pkg_list)
+ */
+async function validateRepoUrl(
+  repoUrl,
+  command = "tizen-sdk validate-repo-url",
+) {
+  const startTime = Date.now();
+  try {
+    const syntax = checkRepoUrlSyntax(repoUrl);
+    if (!syntax.ok) {
+      console.error(
+        `[tizen-sdk-repo] Invalid repository URL: ${syntax.message}`,
+      );
+      return formatError(
+        command,
+        "repo_url_invalid",
+        syntax.message,
+        null,
+        startTime,
+      );
+    }
+
+    const url = syntax.url;
+    console.error(`[tizen-sdk-repo] Validating repository URL: ${url}`);
+
+    const installer = resolveScript("tizen-sdk-install");
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "script_not_found",
+        `Installer script not found, cannot validate the repository URL: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    let output;
+    try {
+      output = execPluginScript(
+        installer.scriptPath,
+        `-RepoUrl "${url}" -ValidateRepoUrl`,
+        `--repo-url="${url}" --validate-repo-url`,
+      );
+    } catch (error) {
+      // Non-zero exit = no pkg_list_{OS}-{64,32} served (or the host is
+      // unreachable). Surface the script's own diagnosis, which lists every
+      // probed URL.
+      const errOutput = (
+        error.stdout ||
+        error.stderr ||
+        error.message ||
+        ""
+      ).toString();
+      console.error(
+        "[tizen-sdk-repo] Repository URL rejected by the validation probe.",
+      );
+      return formatError(
+        command,
+        "repo_url_unreachable",
+        `Not a valid Tizen package repository: ${url}. ` +
+          `Neither pkg_list_{OS}-64 nor pkg_list_{OS}-32 could be fetched from it ` +
+          `(OS = windows | ubuntu | macos). A repository URL must be the directory that ` +
+          `CONTAINS the package list, e.g. ${url}/pkg_list_ubuntu-64. ` +
+          `If this is an internal mirror, check VPN/proxy access from this machine.`,
+        null,
+        startTime,
+        errOutput ? errOutput.split(/\r?\n/).filter(Boolean).slice(-12) : null,
+      );
+    }
+
+    // Machine-readable lines printed by the script's validate mode.
+    const pkgListMatch = /^PKG_LIST=(.+)$/m.exec(output || "");
+    const repoMatch = /^REPOSITORY=(.+)$/m.exec(output || "");
+    const pkgListFile = pkgListMatch ? pkgListMatch[1].trim() : null;
+    const resolvedUrl = repoMatch ? repoMatch[1].trim() : url;
+
+    const warnings = [];
+    if (!pkgListFile) {
+      // Exit code said valid; only the label is missing. Report success but say
+      // the arch could not be determined rather than inventing one.
+      warnings.push(
+        "Repository is valid, but the validation probe did not report which pkg_list file it found.",
+      );
+    }
+
+    console.error(
+      `[tizen-sdk-repo] Repository is valid: ${resolvedUrl} (${pkgListFile || "pkg_list found"})`,
+    );
+
+    return formatRepoUrlValidation(
+      resolvedUrl,
+      pkgListFile,
+      pkgListFile ? `${resolvedUrl}/${pkgListFile}` : null,
+      pkgListFile ? [`${resolvedUrl}/${pkgListFile}`] : [],
+      startTime,
+      warnings,
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "execution_error",
+      `Failed to validate repository URL: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Read the repository URL recorded in {SDK_PATH}/.package/repository.info.
+ *
+ * @param {string} sdkPath
+ * @returns {string|null}
+ */
+function readInstalledRepository(sdkPath) {
+  try {
+    const repoInfoPath = path.join(sdkPath, ".package", "repository.info");
+    if (!fs.existsSync(repoInfoPath)) return null;
+    const match = /^Repository=(.+)$/m.exec(
+      fs.readFileSync(repoInfoPath, "utf-8"),
+    );
+    return match ? match[1].trim() : null;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * Custom-repository SDK installation pre-check (Phase 1)
+ *
+ * Same two-phase contract as installSdk(), with the package source switched from
+ * the timezone-selected CDN mirror to a URL the user supplies. The repository is
+ * validated FIRST: an install is never started against a URL that does not serve
+ * pkg_list_{OS}-{64,32}.
+ *
+ * ⚠️ This function does not perform the installation (10-15 minutes). It
+ * pre-checks and returns the installer command for the agent to run in
+ * background (Phase 2) — except in the pkg-compiled tizen-cli binary, where it
+ * runs the installer directly.
+ *
+ * Flow:
+ *   1. Node.js check
+ *   2. Repository URL validation (pkg_list_{OS}-{64,32} must be served)
+ *   3. SDK already installed? → success (with a warning that --force is needed
+ *      to re-point an existing install at a different repository)
+ *   4. Disk space check (15 GB)
+ *   5. Return the installer command (suggested_fix) for Phase 2
+ *
+ * @param {string} repoUrl - custom package repository base URL (required)
+ * @param {string} [platformVersion] - Tizen platform version (e.g. "11.0").
+ *   Empty = auto-select the highest version the repository offers.
+ * @param {boolean} [force] - force reinstall even if already installed
+ * @returns {object} Standard JSON Envelope
+ */
+async function installSdkFromRepo(
+  repoUrl,
+  platformVersion = "",
+  force = false,
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  // Same as installSdk: checkNode's warnings are merged in one place.
+  const ctx = { nodeWarnings: [] };
+  const env = await installSdkFromRepoSteps(
+    ctx,
+    repoUrl,
+    platformVersion,
+    force,
+    downloadJobs,
+  );
+  return withNodeWarnings(env, ctx.nodeWarnings);
+}
+
+/**
+ * installSdkFromRepo() body; records checkNode's warnings in ctx.nodeWarnings.
+ * Call installSdkFromRepo(), not this: only it merges those warnings.
+ */
+async function installSdkFromRepoSteps(
+  ctx,
+  repoUrl,
+  platformVersion,
+  force,
+  downloadJobs,
+) {
+  const startTime = Date.now();
+  const command = "tizen-sdk sdk-install-custom-repo";
+
+  // 0. Version syntax — the value is spliced into the installer command line.
+  const versionCheck = validateTizenVersion(platformVersion);
+  if (versionCheck.error) {
+    console.error(`[tizen-sdk-repo] ${versionCheck.error}`);
+    return formatError(
+      command,
+      "invalid_argument",
+      versionCheck.error,
+      null,
+      startTime,
+    );
+  }
+  platformVersion = versionCheck.version;
+
+  try {
+    // 1. Node.js check (first)
+    console.error("[tizen-sdk-repo] Checking Node.js installation...");
+    const nodeCheck = await checkNode();
+    ctx.nodeWarnings = nodeCheck.warnings || [];
+    if (nodeCheck.status !== "success") {
+      console.error(
+        "[tizen-sdk-repo] Node.js check failed. Aborting installation.",
+      );
+      return nodeCheck;
+    }
+    console.error(
+      `[tizen-sdk-repo] Node.js OK (${nodeCheck.result.version}). Continuing.`,
+    );
+
+    // 2. Repository URL validation — must pass before anything else happens.
+    const validation = await validateRepoUrl(repoUrl, command);
+    if (validation.status !== "success") {
+      return validation;
+    }
+    const normalizedUrl = validation.result.repository_url;
+    const pkgListFile = validation.result.pkg_list_file;
+
+    const sdkPath = readSdkPath();
+
+    // 3. Already installed?
+    console.error("[tizen-sdk-repo] Checking if SDK is already installed...");
+    const statusCheck = await checkIfSdkAlreadyInstalled(sdkPath, force);
+
+    if (statusCheck.alreadyInstalled) {
+      // An explicitly requested platform must actually be installed.
+      const missing = requestedPlatformMissing(
+        sdkPath,
+        platformVersion,
+        command,
+        startTime,
+      );
+      if (missing) return missing;
+
+      console.error(
+        "[tizen-sdk-repo] SDK installation verified (sdk.info found). Returning success status.",
+      );
+
+      const installedRepo = readInstalledRepository(sdkPath);
+      const warnings = [
+        `SDK installation verified at ${sdkPath} (sdk.info found). To force a reinstall, run with --force (script flag: -Force).`,
+      ];
+      const repairNote = describeSdkInfoRepair(repairSdkInfo(sdkPath));
+      if (repairNote) warnings.push(repairNote);
+      // Do not let the caller believe the custom repository was applied: an
+      // existing install is NOT re-downloaded, so its packages still come from
+      // whatever repository installed it.
+      if (installedRepo && normalizeRepoUrl(installedRepo) !== normalizedUrl) {
+        warnings.push(
+          `The requested repository was NOT applied: the existing SDK was installed from ${installedRepo}. ` +
+            `Re-run with --force to reinstall from ${normalizedUrl}.`,
+        );
+      } else if (!installedRepo) {
+        warnings.push(
+          `The existing SDK has no recorded repository (.package/repository.info missing), so it may not have come from ${normalizedUrl}. ` +
+            `Re-run with --force to reinstall from the requested repository.`,
+        );
+      }
+
+      const { written, result: initResult } =
+        await ensureSdkPathConfig(sdkPath);
+      if (!written) {
+        console.error("[tizen-sdk-repo] SDK path config already points here.");
+      } else if (initResult.status === "success") {
+        console.error(
+          "[tizen-sdk-repo] SDK path config written automatically.",
+        );
+        warnings.push(
+          `SDK path configured automatically: ${sdkPath} → ${CONFIG_FILE}`,
+        );
+      } else {
+        warnings.push(
+          `SDK path config could not be written automatically: ${initResult.errors?.[0]?.message || "unknown error"}. Run "tizen-sdk sdk-init" manually.`,
+        );
+      }
+
+      const packages = installedPackageSummary(sdkPath, platformVersion);
+      return formatCustomRepoInstall(
+        packages,
+        installedRepo || normalizedUrl,
+        warnings,
+        startTime,
+      );
+    }
+
+    if (!statusCheck.shouldProceed) {
+      return formatError(
+        command,
+        "build_failed",
+        statusCheck.reason,
+        null,
+        startTime,
+      );
+    }
+
+    // 4. Disk space (user home drive, 15 GB threshold)
+    console.error(
+      "[tizen-sdk-repo] SDK not installed. Checking disk space (15 GB required)...",
+    );
+    const diskCheck = await checkDiskSpace(os.homedir(), 15);
+    if (diskCheck.status !== "success") {
+      console.error(
+        "[tizen-sdk-repo] Insufficient disk space. Aborting installation.",
+      );
+      return diskCheck;
+    }
+    console.error(
+      `[tizen-sdk-repo] Disk space OK (${diskCheck.result.free_gb} GB free). Proceeding to install.`,
+    );
+
+    // 5. Resolve the custom-repository installer script
+    const installer = resolveScript("tizen-sdk-install-custom-repo");
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "script_not_found",
+        `Custom-repository installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // Explicit install path — see installSdk (issue #70).
+    const pathArgs = installerPathArgs(sdkPath);
+    const winFlags = [`-RepoUrl "${normalizedUrl}"`, pathArgs.win];
+    const unixFlags = [`--repo-url="${normalizedUrl}"`, pathArgs.unix];
+    if (platformVersion) {
+      winFlags.push(`-Platform "${platformVersion}"`);
+      unixFlags.push(`--platform="${platformVersion}"`);
+    }
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+    const jobsFlags = downloadJobsFlags(downloadJobs);
+    winFlags.push(jobsFlags.win);
+    unixFlags.push(jobsFlags.unix);
+
+    const isPkg = runsInstallerInline();
+
+    if (isPkg) {
+      // Direct execution: run the installer synchronously (10-15 min)
+      console.error(
+        `[tizen-sdk-repo] Running installer: ${installer.scriptPath}`,
+      );
+      try {
+        execPluginScript(
+          installer.scriptPath,
+          winFlags.join(" "),
+          unixFlags.join(" "),
+        );
+        console.error("[tizen-sdk-repo] Installer completed.");
+
+        const sdkInfoPath = path.join(sdkPath, "sdk.info");
+        if (!fs.existsSync(sdkInfoPath)) {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but sdk.info not found at ${sdkInfoPath}. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+
+        // Same rule as installSdk: a requested platform must actually be there.
+        const missing = requestedPlatformMissing(
+          sdkPath,
+          platformVersion,
+          command,
+          startTime,
+          { afterInstall: true },
+        );
+        if (missing) return missing;
+
+        const warnings = [
+          `SDK installed successfully at ${sdkPath} from ${normalizedUrl}${pkgListFile ? ` (${pkgListFile})` : ""}.`,
+        ];
+        const initResult = await initSdk(sdkPath);
+        if (initResult.status === "success") {
+          warnings.push(
+            `SDK path configured automatically: ${sdkPath} → ${CONFIG_FILE}`,
+          );
+        } else {
+          warnings.push(
+            `SDK path config could not be written automatically: ${initResult.errors?.[0]?.message || "unknown error"}. Run "tizen-sdk sdk-init" manually.`,
+          );
+        }
+
+        const packages = installedPackageSummary(sdkPath, platformVersion);
+        return formatCustomRepoInstall(
+          packages,
+          readInstalledRepository(sdkPath) || normalizedUrl,
+          warnings,
+          startTime,
+        );
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: `SDK installation from ${normalizedUrl}`,
+          sdkPath,
+          logGroup: "sdk-install-custom-repo",
+          resumes: true,
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    }
+
+    // Non-pkg (Claude Code / Cline / Codex): hand the installer command to the agent.
+    const installerCommand = installerFix(
+      "tizen-sdk-install-custom-repo",
+      installer.scriptPath,
+      winFlags.join(" "),
+      unixFlags.join(" "),
+    );
+
+    return formatError(
+      command,
+      "install_required",
+      `SDK is NOT installed. The repository ${normalizedUrl} is valid` +
+        `${pkgListFile ? ` (${pkgListFile} found)` : ""}, but this pre-check CLI cannot install it (10-15 min job). ` +
+        harnessGuidance("detach") +
+        sdkPrecheckRerunHint(
+          "<sdk-path>/sdk.info exists, the requested platform is installed and <sdk-path>/.package/repository.info records the custom repository",
+          { customRepo: true },
+        ) +
+        "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+      installerCommand,
+      startTime,
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install SDK from custom repository: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Emulator package download pre-check (Phase 1)
+ *
+ * Downloads the TIZEN-{platform_version}-Emulator package (and its dependencies)
+ * from the Tizen package repository. The repository URL is read from
+ * {SDK_PATH}/.package/repository.info (written during SDK install), falling
+ * back to the official repo if the file is missing.
+ *
+ * This function performs pre-check only, not the actual download/install.
+ * The actual download is performed by the agent via background script (Phase 2).
+ *
+ * Flow:
+ * 1. Check if Tizen SDK is installed (sdk.info) — abort if not
+ * 2. Check if the emulator package is already installed (.emulator-package-installed marker)
+ * 3. Return the download script command (suggested_fix) — agent executes in Phase 2 background
+ *
+ * @param {string} platformVersion - Tizen platform version (e.g., "10.0", "11.0"). Auto-detects latest if empty.
+ * @param {boolean} force - force reinstall (default: false)
+ * @returns {object} Standard JSON Envelope
+ */
+/**
+ * Parse the platform versions recorded in a .emulator-package-installed marker.
+ *
+ * The marker accumulates one "Platform version: X.Y" line per installed
+ * platform. Legacy markers (written before per-version records) carry a single
+ * last-write-wins line or none at all — both simply yield fewer entries.
+ * Tolerates CRLF line endings (\s*$ eats the \r) and missing/extra spaces
+ * around the value.
+ *
+ * Exported for unit testing.
+ *
+ * @param {string} markerBody - marker file content
+ * @returns {string[]} recorded platform versions, e.g. ["10.0", "11.0"]
+ */
+function parseEmulatorMarkerPlatforms(markerBody) {
+  return [
+    ...String(markerBody || "").matchAll(
+      /^Platform version:[ \t]*(\S+)[ \t]*\r?$/gm,
+    ),
+  ].map((m) => m[1]);
+}
+
+/**
+ * Does the marker satisfy this request?
+ *
+ * - Explicit platformVersion: satisfied only when that exact version is
+ *   recorded. A 10.0-era marker must NOT answer an 11.0 request — that is how
+ *   the tizen-11.0 emulator resources ended up never being fetched.
+ * - No platformVersion (auto-detect latest): any completed install satisfies
+ *   the request. The pre-check runs without network access, so it cannot know
+ *   what "latest" resolves to; the message lists the recorded platforms and
+ *   how to request a specific one.
+ *
+ * Exported for unit testing.
+ *
+ * @param {string} markerBody - marker file content
+ * @param {string} platformVersion - requested version, or "" for auto-detect
+ * @returns {{satisfied: boolean, recorded: string[]}}
+ */
+function isEmulatorMarkerSatisfied(markerBody, platformVersion) {
+  const recorded = parseEmulatorMarkerPlatforms(markerBody);
+  const satisfied = platformVersion ? recorded.includes(platformVersion) : true;
+  return { satisfied, recorded };
+}
+
+async function downloadEmulatorPackage(
+  platformVersion = "",
+  force = false,
+  command = "tizen-sdk download-emulator-package",
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  const startTime = Date.now();
+  try {
+    // 0. Version syntax (X.Y, empty = newest) — the value is spliced into the
+    // installer command line below, so reject anything else before touching
+    // the host (same screen as installPlatform / installSdk).
+    const versionCheck = validateTizenVersion(platformVersion);
+    if (versionCheck.error) {
+      console.error(`[tizen-emulator-pkg] ${versionCheck.error}`);
+      return formatError(
+        command,
+        "invalid_argument",
+        versionCheck.error,
+        null,
+        startTime,
+      );
+    }
+    platformVersion = versionCheck.version;
+
+    // 1. Check if Tizen SDK is installed
+    const sdkPath = readSdkPath();
+    console.error("[tizen-emulator-pkg] Checking if Tizen SDK is installed...");
+
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      console.error(
+        "[tizen-emulator-pkg] Tizen SDK is NOT installed. Aborting emulator package download.",
+      );
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is not installed. Emulator package download requires Tizen SDK to be installed first. " +
+          "Please install Tizen SDK first (use the tizen-sdk-install skill), then retry emulator package download.",
+        null,
+        startTime,
+      );
+    }
+    console.error(
+      `[tizen-emulator-pkg] Tizen SDK found at ${sdkPath}. Continuing.`,
+    );
+
+    // 2. Check if emulator package is already installed — PER PLATFORM VERSION.
+    // The marker accumulates one "Platform version: X.Y" line per installed
+    // platform. A bare exists-check made a 10.0-era marker answer an 11.0
+    // request with "already installed", so the 11.0 emulator resources were
+    // never fetched. When a specific version is requested and the marker does
+    // not record it, fall through to the install suggestion — the installer
+    // itself is idempotent per package.
+    const emulPkgMarker = path.join(sdkPath, ".emulator-package-installed");
+    // The marker only knows about installs made by this skill; the SDK, TV SDK
+    // and platform installers also drop emulator images without touching it.
+    // Report what is actually on disk alongside the marker so the envelope is
+    // not read as "only the recorded platforms are installed".
+    const installedImages = listInstalledEmulatorImages(sdkPath);
+    const onDiskNote = ` Emulator images on disk: ${describeEmulatorImages(installedImages)}.`;
+    if (fs.existsSync(emulPkgMarker) && !force) {
+      const markerBody = fs.readFileSync(emulPkgMarker, "utf-8");
+      const { satisfied: versionSatisfied, recorded: recordedPlatforms } =
+        isEmulatorMarkerSatisfied(markerBody, platformVersion);
+
+      if (versionSatisfied) {
+        console.error(
+          "[tizen-emulator-pkg] Emulator package is already installed (.emulator-package-installed found).",
+        );
+        const packages = [
+          {
+            name: platformVersion
+              ? `TIZEN-${platformVersion}-Emulator`
+              : "TIZEN-Emulator",
+            status: "installed",
+            version: "emulator",
+          },
+        ];
+        const recordedNote =
+          recordedPlatforms.length > 0
+            ? ` Recorded by this skill: ${recordedPlatforms.join(", ")}.`
+            : "";
+        const warnings = [
+          `Emulator package installation verified at ${sdkPath} (.emulator-package-installed found).${recordedNote}${onDiskNote} ` +
+            `To force a reinstall, run with --force. To install another platform's emulator package, pass --platform-version <X.Y>.`,
+        ];
+        return formatEmulatorPackageDownload(
+          packages,
+          warnings,
+          startTime,
+          command,
+          installedImages,
+        );
+      }
+
+      console.error(
+        `[tizen-emulator-pkg] Marker found, but platform ${platformVersion} is not recorded ` +
+          `(recorded: ${recordedPlatforms.join(", ") || "none"}). Proceeding with install suggestion.`,
+      );
+    }
+
+    // 3. Resolve emulator package download script
+    const installer = resolveScript("tizen-download-emulator-package");
+
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // In pkg-compiled binary (tizen-cli), execute the installer directly.
+    // In Claude Code / Cline (non-pkg), return the installer command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    // Build arguments
+    const winFlags = [`-SdkPath "${sdkPath.replace(/\\/g, "/")}"`];
+    const unixFlags = [`--sdk-path="${sdkPath}"`];
+    if (platformVersion) {
+      winFlags.push(`-PlatformVersion "${platformVersion}"`);
+      unixFlags.push(`--platform-version="${platformVersion}"`);
+    }
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+    const jobsFlags = downloadJobsFlags(downloadJobs);
+    winFlags.push(jobsFlags.win);
+    unixFlags.push(jobsFlags.unix);
+
+    if (isPkg) {
+      // Direct execution: run download script synchronously
+      console.error(
+        `[tizen-emulator-pkg] Running installer: ${installer.scriptPath}`,
+      );
+      try {
+        const winArgs = winFlags.join(" ");
+        const unixArgs = unixFlags.join(" ");
+        execPluginScript(installer.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-emulator-pkg] Installer completed.");
+
+        // Verify installation: check .emulator-package-installed marker
+        if (fs.existsSync(emulPkgMarker)) {
+          console.error(
+            "[tizen-emulator-pkg] Emulator package installation verified (.emulator-package-installed found).",
+          );
+          const packages = [
+            {
+              name: platformVersion
+                ? `TIZEN-${platformVersion}-Emulator`
+                : "TIZEN-Emulator",
+              status: "installed",
+              version: "emulator",
+            },
+          ];
+          const imagesAfterInstall = listInstalledEmulatorImages(sdkPath);
+          const warnings = [
+            `Emulator package installed successfully at ${sdkPath}. ` +
+              `Emulator images on disk: ${describeEmulatorImages(imagesAfterInstall)}.`,
+          ];
+          return formatEmulatorPackageDownload(
+            packages,
+            warnings,
+            startTime,
+            command,
+            imagesAfterInstall,
+          );
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but .emulator-package-installed not found at ${emulPkgMarker}. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "Emulator package download",
+          sdkPath,
+          logGroup: "download-emulator-package",
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): return installer command as suggested_fix
+      const installerCommand = installerFix(
+        "tizen-download-emulator-package",
+        installer.scriptPath,
+        winFlags.join(" "),
+        unixFlags.join(" "),
+      );
+
+      return formatError(
+        command,
+        "install_required",
+        "Emulator package is NOT installed. This pre-check CLI cannot install it." +
+          onDiskNote +
+          " " +
+          harnessGuidance("foreground") +
+          "Either way, afterwards re-run this CLI to verify <sdk-path>/.emulator-package-installed exists. " +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+        // errors[].details is a list of diagnostic lines (Envelope drops any
+        // other shape), so the scan goes out one line per image here.
+        installedImages.map(
+          ({ platform, profile, image }) =>
+            `${image} (platform ${platform}, profile ${profile})`,
+        ),
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to download emulator package: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Platform package installation pre-check (Phase 1)
+ *
+ * Downloads the TIZEN-{platform_version} platform package (and its dependencies)
+ * from the Tizen package repository. The repository URL is read from
+ * {SDK_PATH}/.package/repository.info (written during SDK install), falling
+ * back to the official repo if the file is missing.
+ *
+ * This function performs pre-check only, not the actual download/install.
+ * The actual download is performed by the agent via background script (Phase 2).
+ *
+ * Flow:
+ * 1. Check if Tizen SDK is installed (sdk.info) — abort if not
+ * 2. Check if this version is already installed (isPlatformInstalled: platforms/tizen-X.Y, no in-progress marker)
+ * 3. Return the download script command (suggested_fix) — agent executes in Phase 2 background
+ *
+ * @param {string} platformVersion - Tizen platform version (e.g., "10.0", "11.0"). Auto-detects latest if empty.
+ * @param {boolean} force - force reinstall (default: false)
+ * @returns {object} Standard JSON Envelope
+ */
+async function installPlatform(
+  platformVersion = "",
+  force = false,
+  command = "tizen-sdk platform-install",
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  const startTime = Date.now();
+  try {
+    // 0. Validate that platformVersion is provided (required)
+    if (!platformVersion) {
+      console.error(
+        "[tizen-platform-pkg] --platform-version is required but was not provided.",
+      );
+      return formatError(
+        command,
+        "invalid_argument",
+        "Missing required option: --platform-version <version>. " +
+          "Specify the Tizen platform version to install (e.g., 10.0, 11.0). " +
+          "The target package is TIZEN-{version}.",
+        null,
+        startTime,
+      );
+    }
+
+    // 0b. Version syntax (X.Y) — the value is spliced into the installer
+    // command line below, so reject anything else before touching the host.
+    const versionCheck = validateTizenVersion(platformVersion, {
+      required: true,
+    });
+    if (versionCheck.error) {
+      console.error(`[tizen-platform-pkg] ${versionCheck.error}`);
+      return formatError(
+        command,
+        "invalid_argument",
+        versionCheck.error,
+        null,
+        startTime,
+      );
+    }
+    platformVersion = versionCheck.version;
+
+    // 1. Check if Tizen SDK is installed
+    const sdkPath = readSdkPath();
+    console.error("[tizen-platform-pkg] Checking if Tizen SDK is installed...");
+
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      console.error(
+        "[tizen-platform-pkg] Tizen SDK is NOT installed. Aborting platform package installation.",
+      );
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is not installed. Platform package installation requires Tizen SDK to be installed first. " +
+          "Please install Tizen SDK first (use the tizen-sdk-install skill), then retry platform package installation.",
+        null,
+        startTime,
+      );
+    }
+    console.error(
+      `[tizen-platform-pkg] Tizen SDK found at ${sdkPath}. Continuing.`,
+    );
+
+    // 2. Check if this platform version is already installed. Other installed
+    // versions do not matter: several TIZEN-X.Y live side by side.
+    const platformDir = path.join(
+      sdkPath,
+      "platforms",
+      `tizen-${platformVersion}`,
+    );
+    const installingMarker = platformInstallingMarker(sdkPath, platformVersion);
+    if (!force && isTizenPlatformInstalled(sdkPath, platformVersion)) {
+      console.error(
+        `[tizen-platform-pkg] Platform package TIZEN-${platformVersion} is already installed (${platformDir} found).`,
+      );
+      const packages = [
+        {
+          name: `TIZEN-${platformVersion}`,
+          status: "installed",
+          version: platformVersion,
+        },
+      ];
+      const others = installedTizenPlatformVersions(sdkPath).filter(
+        (v) => v !== platformVersion,
+      );
+      const warnings = [
+        `Platform package installation verified at ${platformDir}. To force a reinstall, run with --force.`,
+      ];
+      if (others.length) {
+        warnings.push(`Other installed platforms: ${others.join(", ")}.`);
+      }
+      return formatPlatformInstall(packages, warnings, startTime, command);
+    }
+    if (fs.existsSync(installingMarker)) {
+      console.error(
+        `[tizen-platform-pkg] An earlier TIZEN-${platformVersion} install did not finish (${installingMarker} found). Re-running it resumes from the packages already installed.`,
+      );
+    }
+
+    // 3. Resolve platform package install script
+    const installer = resolveScript("tizen-platform-install");
+
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // In pkg-compiled binary (tizen-cli), execute the installer directly.
+    // In Claude Code / Cline (non-pkg), return the installer command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    // Build arguments
+    const winFlags = [`-SdkPath "${sdkPath.replace(/\\/g, "/")}"`];
+    const unixFlags = [`--sdk-path="${sdkPath}"`];
+    if (platformVersion) {
+      winFlags.push(`-PlatformVersion "${platformVersion}"`);
+      unixFlags.push(`--platform-version="${platformVersion}"`);
+    }
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+    const jobsFlags = downloadJobsFlags(downloadJobs);
+    winFlags.push(jobsFlags.win);
+    unixFlags.push(jobsFlags.unix);
+
+    if (isPkg) {
+      // Direct execution: run install script synchronously
+      console.error(
+        `[tizen-platform-pkg] Running installer: ${installer.scriptPath}`,
+      );
+      try {
+        const winArgs = winFlags.join(" ");
+        const unixArgs = unixFlags.join(" ");
+        execPluginScript(installer.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-platform-pkg] Installer completed.");
+
+        // Verify installation: the platform directory exists and the run's
+        // in-progress marker is gone.
+        if (isTizenPlatformInstalled(sdkPath, platformVersion)) {
+          console.error(
+            `[tizen-platform-pkg] Platform package installation verified (${platformDir} found).`,
+          );
+          const packages = [
+            {
+              name: platformVersion
+                ? `TIZEN-${platformVersion}`
+                : "TIZEN-Platform",
+              status: "installed",
+              version: platformVersion || "latest",
+            },
+          ];
+          const warnings = [
+            `Platform package installed successfully at ${sdkPath}.`,
+          ];
+          return formatPlatformInstall(packages, warnings, startTime, command);
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but TIZEN-${platformVersion} is not installed (${platformDir} missing, or ${installingMarker} still present). Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "Platform package installation",
+          sdkPath,
+          logGroup: "platform-install",
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): return installer command as suggested_fix
+      const installerCommand = installerFix(
+        "tizen-platform-install",
+        installer.scriptPath,
+        winFlags.join(" "),
+        unixFlags.join(" "),
+      );
+
+      return formatError(
+        command,
+        "install_required",
+        "Platform package is NOT installed. This pre-check CLI cannot install it. " +
+          harnessGuidance("foreground") +
+          `Either way, afterwards re-run this CLI to verify <sdk-path>/platforms/tizen-${platformVersion} exists and <sdk-path>/.platform-installing-${platformVersion} is gone. ` +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install platform package: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * List the Tizen platform versions in the installed SDK (read-only).
+ *
+ * One entry per platform the user installed, oldest first — the versions
+ * .platform-installed records (installedPlatformEntries), not every
+ * platforms/tizen-X.Y directory: the TV extension also lays down tv /
+ * tv-samsung for older versions nobody asked for.
+ *   - status: "installed" when the recorded profiles are on disk;
+ *     "incomplete" while a tizen-platform-install run of that version has not
+ *     finished; "not_installed" when the recorded directories are gone
+ *   - profiles: the recorded profiles of that version that are on disk
+ *     (e.g. "tizen", plus "tv-samsung" when the TV extension was installed
+ *     for it)
+ *   - emulator_images: emulator image directories of that version
+ * result.newest is the newest installed entry. create-project and
+ * list-templates still accept any platforms/tizen-X.Y that holds a payload
+ * (isPlatformInstalled), so a bundled older TV version stays usable there.
+ *
+ * @param {string} [command]
+ * @returns {object} Standard JSON Envelope
+ */
+async function listPlatforms(command = "tizen-sdk platform-list") {
+  const startTime = Date.now();
+  try {
+    const sdkPath = readSdkPath();
+    if (!checkSdkInstallStatus(sdkPath).installed) {
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        `Tizen SDK is not installed at ${sdkPath} (sdk.info not found). Install it with the tizen-sdk-install skill, or run tizen-sdk-init if it lives elsewhere.`,
+        null,
+        startTime,
+      );
+    }
+    const images = listInstalledEmulatorImages(sdkPath);
+    const platforms = installedPlatformEntries(sdkPath).map((entry) => {
+      const { version } = entry;
+      return {
+        version,
+        status: entry.status,
+        profiles: entry.profiles,
+        emulator_images: images
+          .filter((i) => i.platform === version)
+          .map((i) => ({ profile: i.profile, image: i.image })),
+      };
+    });
+    const warnings = platforms
+      .filter((p) => p.status === "incomplete")
+      .map(
+        (p) =>
+          `TIZEN-${p.version} did not finish installing — re-run tizen-platform-install --platform-version ${p.version} to resume it.`,
+      );
+    if (!platforms.some((p) => p.status === "installed")) {
+      warnings.push(
+        `No installed platform found under ${sdkPath}/platforms. Install one with tizen-platform-install --platform-version <X.Y>.`,
+      );
+    }
+    return formatPlatformList(sdkPath, platforms, startTime, warnings, command);
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to list platforms: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Mobile platform package download pre-check (Phase 1)
+ *
+ * Downloads the MOBILE-{platform_version} platform package (and its dependencies)
+ * from the Tizen package repository. Optionally downloads and installs the
+ * IOT-Headed extension by:
+ *   1) Downloading extension_info.xml to get the IoT Headed repository URL
+ *   2) Downloading pkg_list from the IoT repository
+ *   3) Resolving and installing IOT-Headed-{version} package
+ *
+ * The repository URL is read from {SDK_PATH}/.package/repository.info, falling
+ * back to the official repo if the file is missing.
+ *
+ * This function performs pre-check only, not the actual download/install.
+ * The actual download is performed by the agent via background script (Phase 2).
+ *
+ * Flow:
+ * 1. Check if Tizen SDK is installed (sdk.info) — abort if not
+ * 2. Check if the mobile platform package is already installed (.mobile-platform-installed marker)
+ * 3. Return the download script command (suggested_fix) — agent executes in Phase 2 background
+ *
+ * @param {string} platformVersion - Tizen Mobile platform version (e.g., "10.0", "11.0"). Auto-detects latest if empty.
+ * @param {boolean} includeIotHeaded - Whether to also download IOT-Headed extension (default: false)
+ * @param {string} iotHeadedVersion - Specific IOT-Headed version to install. Auto-detects latest if empty.
+ * @param {boolean} force - force reinstall (default: false)
+ * @returns {object} Standard JSON Envelope
+ */
+async function downloadMobilePlatform(
+  platformVersion = "",
+  includeIotHeaded = false,
+  iotHeadedVersion = "",
+  force = false,
+  command = "tizen-sdk download-mobile-platform",
+  downloadJobs = DEFAULT_DOWNLOAD_JOBS,
+) {
+  const startTime = Date.now();
+  try {
+    // 0. Version syntax (X.Y, empty = newest) — both values are spliced into
+    // the installer command line below, so reject anything else before
+    // touching the host (same screen as installPlatform / installSdk).
+    const versionCheck = validateTizenVersion(platformVersion);
+    if (versionCheck.error) {
+      console.error(`[tizen-mobile-pkg] ${versionCheck.error}`);
+      return formatError(
+        command,
+        "invalid_argument",
+        versionCheck.error,
+        null,
+        startTime,
+      );
+    }
+    platformVersion = versionCheck.version;
+    const iotCheck = validateTizenVersion(iotHeadedVersion);
+    if (iotCheck.error) {
+      const msg = `Invalid --iot-headed-version: ${iotCheck.error}`;
+      console.error(`[tizen-mobile-pkg] ${msg}`);
+      return formatError(command, "invalid_argument", msg, null, startTime);
+    }
+    iotHeadedVersion = iotCheck.version;
+
+    // 1. Check if Tizen SDK is installed
+    const sdkPath = readSdkPath();
+    console.error("[tizen-mobile-pkg] Checking if Tizen SDK is installed...");
+
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      console.error(
+        "[tizen-mobile-pkg] Tizen SDK is NOT installed. Aborting mobile platform package download.",
+      );
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is not installed. Mobile platform package download requires Tizen SDK to be installed first. " +
+          "Please install Tizen SDK first (use the tizen-sdk-install skill), then retry mobile platform package download.",
+        null,
+        startTime,
+      );
+    }
+    console.error(
+      `[tizen-mobile-pkg] Tizen SDK found at ${sdkPath}. Continuing.`,
+    );
+
+    // 2. Check if mobile platform package is already installed
+    const mobilePkgMarker = path.join(sdkPath, ".mobile-platform-installed");
+    if (fs.existsSync(mobilePkgMarker) && !force) {
+      // Read the marker to check which platform version was installed
+      let markerVersion = "";
+      let markerIotHeaded = false;
+      try {
+        const markerContent = fs.readFileSync(mobilePkgMarker, "utf-8");
+        const versionMatch = markerContent.match(/Platform version:\s*(.+)/);
+        if (versionMatch) {
+          markerVersion = versionMatch[1].trim();
+        }
+        markerIotHeaded = markerContent.includes("IOT-Headed:");
+      } catch (_e) {
+        // If we can't read the marker, proceed with installation
+      }
+
+      // Only skip if the marker version matches the requested version
+      if (markerVersion === platformVersion) {
+        if (!includeIotHeaded || markerIotHeaded) {
+          console.error(
+            `[tizen-mobile-pkg] Mobile platform package MOBILE-${platformVersion} is already installed (.mobile-platform-installed found, version ${markerVersion}).`,
+          );
+          const packages = [
+            {
+              name: `MOBILE-${platformVersion}`,
+              status: "installed",
+              version: platformVersion,
+            },
+          ];
+          const warnings = [
+            `Mobile platform package installation verified at ${sdkPath} (.mobile-platform-installed found, version ${markerVersion}). To force a reinstall, run with --force.`,
+          ];
+          return formatMobilePlatformDownload(
+            packages,
+            markerIotHeaded,
+            warnings,
+            startTime,
+            command,
+          );
+        } else {
+          console.error(
+            `[tizen-mobile-pkg] Mobile platform installed but IOT-Headed extension not installed. Will install IOT-Headed only.`,
+          );
+        }
+      } else {
+        console.error(
+          `[tizen-mobile-pkg] .mobile-platform-installed found but for version ${markerVersion || "unknown"}, requested ${platformVersion}. Proceeding with installation.`,
+        );
+      }
+    }
+
+    if (force) {
+      console.error("[tizen-mobile-pkg] Force reinstall requested.");
+      if (fs.existsSync(mobilePkgMarker)) {
+        fs.unlinkSync(mobilePkgMarker);
+      }
+    }
+
+    // 3. Resolve mobile platform package download script
+    const installer = resolveScript("tizen-download-mobile-platform");
+
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // In pkg-compiled binary (tizen-cli), execute the installer directly.
+    // In Claude Code / Cline (non-pkg), return the installer command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    // Build arguments
+    const winFlags = [`-SdkPath "${sdkPath.replace(/\\/g, "/")}"`];
+    const unixFlags = [`--sdk-path="${sdkPath}"`];
+    if (platformVersion) {
+      winFlags.push(`-PlatformVersion "${platformVersion}"`);
+      unixFlags.push(`--platform-version="${platformVersion}"`);
+    }
+    if (includeIotHeaded) {
+      winFlags.push("-IncludeIotHeaded");
+      unixFlags.push("--include-iot-headed");
+    }
+    if (iotHeadedVersion) {
+      winFlags.push(`-IotHeadedVersion "${iotHeadedVersion}"`);
+      unixFlags.push(`--iot-headed-version="${iotHeadedVersion}"`);
+    }
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+    const jobsFlags = downloadJobsFlags(downloadJobs);
+    winFlags.push(jobsFlags.win);
+    unixFlags.push(jobsFlags.unix);
+
+    if (isPkg) {
+      // Direct execution: run download script synchronously
+      console.error(
+        `[tizen-mobile-pkg] Running installer: ${installer.scriptPath}`,
+      );
+      try {
+        const winArgs = winFlags.join(" ");
+        const unixArgs = unixFlags.join(" ");
+        execPluginScript(installer.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-mobile-pkg] Installer completed.");
+
+        // Verify installation: check .mobile-platform-installed marker
+        if (fs.existsSync(mobilePkgMarker)) {
+          console.error(
+            "[tizen-mobile-pkg] Mobile platform package installation verified (.mobile-platform-installed found).",
+          );
+          const packages = [
+            {
+              name: platformVersion
+                ? `MOBILE-${platformVersion}`
+                : "MOBILE-Platform",
+              status: "installed",
+              version: platformVersion || "latest",
+            },
+          ];
+          // Check if IOT-Headed was installed
+          let iotHeadedInstalled = false;
+          try {
+            const markerContent = fs.readFileSync(mobilePkgMarker, "utf-8");
+            iotHeadedInstalled = markerContent.includes("IOT-Headed:");
+          } catch (_e) {
+            // Ignore
+          }
+          const warnings = [
+            `Mobile platform package installed successfully at ${sdkPath}.`,
+          ];
+          return formatMobilePlatformDownload(
+            packages,
+            iotHeadedInstalled,
+            warnings,
+            startTime,
+            command,
+          );
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but .mobile-platform-installed not found at ${mobilePkgMarker}. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "Mobile platform package download",
+          sdkPath,
+          logGroup: "download-mobile-platform",
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): return installer command as suggested_fix
+      const installerCommand = installerFix(
+        "tizen-download-mobile-platform",
+        installer.scriptPath,
+        winFlags.join(" "),
+        unixFlags.join(" "),
+      );
+
+      return formatError(
+        command,
+        "install_required",
+        "Mobile platform package is NOT installed. This pre-check CLI cannot install it. " +
+          harnessGuidance("foreground") +
+          "Either way, afterwards re-run this CLI to verify <sdk-path>/.mobile-platform-installed exists. " +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to download mobile platform package: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Parse the `.rootstrap-installed` marker written by
+ * tizen-install-rootstrap.sh/.ps1:
+ *
+ *   Rootstrap installed at <ISO date>
+ *     - <profile>-<version>-<device> (XML: <path>)
+ *   Structure: data|tizen-studio
+ *
+ * Tolerates CRLF line endings and a UTF-8 BOM (Windows PowerShell 5.1's
+ * `Set-Content -Encoding UTF8` writes one).
+ *
+ * @param {string} markerContent
+ * @returns {{rootstraps: object[], structureType: string}}
+ */
+function parseRootstrapMarker(markerContent) {
+  const text = String(markerContent || "").replace(/^\uFEFF/, "");
+  const rootstraps = [];
+  let structureType = "unknown";
+
+  const structureMatch = text.match(/Structure:\s*(\S+)/);
+  if (structureMatch) {
+    structureType = structureMatch[1];
+  }
+
+  // One "  - <name> (XML: <path>)" entry per line. Only horizontal whitespace
+  // may precede the dash: with `\s*` the match could start on an earlier
+  // blank line and swallow the newline.
+  const rootstrapLines = text.match(/^[ \t]*-[ \t]*(.+)$/gm) || [];
+  for (const line of rootstrapLines) {
+    let displayName = line.replace(/^[ \t]*-[ \t]*/, "").trim();
+    // Remove (XML: ...) suffix to extract clean profile-version-arch
+    displayName = displayName.replace(/\s*\(XML:.*\)\s*$/, "").trim();
+    if (!displayName) continue;
+    // Same regex the installers (tizen-install-rootstrap.sh/.ps1) use to
+    // derive DisplayName from the plugin XML filename, so every line they
+    // write matches: the device part never contains a hyphen; a hyphenated
+    // profile (tv-samsung) lands in the greedy first group. The fallback is
+    // only for hand-edited or foreign markers and keeps the object shape.
+    const match = displayName.match(/^(.+)-([0-9]+\.[0-9]+)-([a-zA-Z0-9_]+)$/);
+    rootstraps.push(
+      match
+        ? {
+            profile: match[1],
+            version: match[2],
+            architecture: match[3],
+            display_name: displayName,
+          }
+        : {
+            profile: null,
+            version: null,
+            architecture: null,
+            display_name: displayName,
+          },
+    );
+  }
+
+  return { rootstraps, structureType };
+}
+
+/**
+ * Custom rootstrap installation pre-check (Phase 1)
+ *
+ * Validates ZIP file path, extracts to temporary location, detects structure,
+ * parses XML metadata, and copies tools/platforms to SDK.
+ *
+ * Flow:
+ * 1. Validate ZIP path (security checks)
+ * 2. Verify Tizen SDK is installed
+ * 3. Check if a rootstrap is already installed (.rootstrap-installed marker)
+ *    — success envelope built from the marker unless --force
+ * 4. Extract ZIP to temporary directory
+ * 5. Detect ZIP structure (data/ or tizen-studio/)
+ * 6. Parse rootstrap XML metadata
+ * 7. Copy tools and platforms folders
+ * 8. Create .rootstrap-installed marker
+ *
+ * @param {string} zipPath - Path to the rootstrap ZIP file (required)
+ * @param {boolean} force - Force reinstall (default: false)
+ * @param {string} [command] - Command name for envelope
+ * @returns {object} Standard JSON Envelope
+ */
+async function installRootstrap(
+  zipPath,
+  force = false,
+  command = "tizen-sdk install-rootstrap",
+) {
+  const startTime = Date.now();
+  try {
+    // Validate zipPath parameter
+    if (!zipPath || typeof zipPath !== "string") {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "ZipPath is required. Use --zip-path <path> to specify the rootstrap ZIP file.",
+        null,
+        startTime,
+      );
+    }
+
+    const sdkPath = readSdkPath();
+
+    // Verify Tizen SDK is installed
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is NOT installed. Rootstrap installation requires Tizen SDK to be installed first.",
+        null,
+        startTime,
+      );
+    }
+
+    // Check if a rootstrap is already installed. This is what the agent's
+    // post-Phase-2 re-run relies on: in Claude Code / Cline / Codex the
+    // pre-check cannot run the installer, so without this step the CLI kept
+    // answering "NOT installed" after a successful install (marker present).
+    //
+    // Order matters: after the SDK check (a marker under a missing SDK is
+    // meaningless) and before the installer hand-off (so a verified install
+    // never yields another suggested_fix). With --force the marker is left
+    // alone here — the installer removes and rewrites it itself.
+    const rootstrapMarker = path.join(sdkPath, ".rootstrap-installed");
+    const markerExists = fs.existsSync(rootstrapMarker);
+    if (markerExists && !force) {
+      console.error(
+        "[tizen-sdk] Rootstrap is already installed (.rootstrap-installed found).",
+      );
+      const { rootstraps, structureType } = parseRootstrapMarker(
+        fs.readFileSync(rootstrapMarker, "utf-8"),
+      );
+      const warnings = [
+        `Rootstrap installation verified at ${sdkPath} (.rootstrap-installed found). ` +
+          "If the ZIP holds a rootstrap that is not listed in result.rootstraps, or to reinstall, run with --force.",
+      ];
+      return formatRootstrapInstall(
+        rootstraps,
+        structureType,
+        warnings,
+        startTime,
+        command,
+      );
+    }
+
+    // Resolve installer script
+    const installer = resolveScript("tizen-install-rootstrap");
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // The ZIP path is spliced into a shell command line below (and, in the
+    // non-pkg harnesses, handed back as suggested_fix.command for the agent to
+    // run) — the \" replacement alone is not an escape cmd.exe honours and
+    // bash gets no escaping at all, so screen the value instead.
+    const unsafeZip = checkShellSafe(zipPath, "--zip-path", command, startTime);
+    if (unsafeZip) return unsafeZip;
+
+    // Build installer command. -SdkPath pins the SDK this pre-check validated;
+    // without it the script falls back to Get-SdkPath, whose candidates include
+    // $env:TIZEN_SDK_PATH and may resolve to a different install.
+    const winFlags = [
+      `-ZipPath "${zipPath.replace(/"/g, '\\"')}"`,
+      `-SdkPath "${sdkPath.replace(/\\/g, "/")}"`,
+    ];
+    const unixFlags = [`--zip-path "${zipPath}"`, `--sdk-path "${sdkPath}"`];
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+
+    const isPkg = runsInstallerInline();
+
+    if (isPkg) {
+      // Direct execution: run installer script synchronously
+      console.error(
+        `[tizen-sdk] Running rootstrap installer: ${installer.scriptPath}`,
+      );
+      try {
+        const winArgs = winFlags.join(" ");
+        const unixArgs = unixFlags.join(" ");
+        execPluginScript(installer.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-sdk] Rootstrap installer completed.");
+
+        // Verify installation: check .rootstrap-installed marker
+        if (fs.existsSync(rootstrapMarker)) {
+          console.error(
+            "[tizen-sdk] Rootstrap installation verified (.rootstrap-installed found).",
+          );
+
+          // Parse marker to extract rootstrap info
+          const { rootstraps, structureType } = parseRootstrapMarker(
+            fs.readFileSync(rootstrapMarker, "utf-8"),
+          );
+
+          const warnings = [`Rootstrap installed successfully at ${sdkPath}.`];
+          return formatRootstrapInstall(
+            rootstraps,
+            structureType,
+            warnings,
+            startTime,
+            command,
+          );
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but .rootstrap-installed not found. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "Rootstrap installation",
+          sdkPath,
+          logGroup: "install-rootstrap",
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): return installer command as suggested_fix
+      const installerCommand = installerFix(
+        "tizen-install-rootstrap",
+        installer.scriptPath,
+        winFlags.join(" "),
+        unixFlags.join(" "),
+      );
+
+      // Say what is actually true: with --force the marker may well exist
+      // and the installer is about to replace it, not create it.
+      const state = markerExists
+        ? "Rootstrap is already installed (.rootstrap-installed found) but --force was given, so it will be reinstalled. "
+        : "Rootstrap is NOT installed. ";
+      return formatError(
+        command,
+        "install_required",
+        state +
+          "This pre-check CLI cannot install it. " +
+          harnessGuidance("foreground") +
+          "Either way, afterwards re-run this CLI (without --force) to verify <sdk-path>/.rootstrap-installed exists. " +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install rootstrap: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * TV SDK extension installation from a local ZIP file (offline) — pre-check (Phase 1)
+ *
+ * Similar to installTvSdk(), but instead of downloading packages from the online
+ * TV extensions repository, all packages are already bundled in a local ZIP file.
+ * The ZIP is expected to contain inner ZIPs (in binary/ or at root) that are
+ * extracted directly into the SDK tools path.
+ *
+ * Flow:
+ * 1. Validate zipPath parameter
+ * 2. Check if Tizen SDK is installed (sdk.info) — abort with interactive guidance if not
+ * 3. Check if this ZIP's TV version is already installed (zipTvInstalled:
+ *    .platform-installed records this ZIP, or tvVersion, for a TV profile)
+ * 4. Return TV SDK ZIP installer command (suggested_fix) — agent executes in Phase 2
+ *
+ * Several TV versions can be installed side by side from their ZIPs (TV 9.0,
+ * 10.0, 11.0). The installer reads the version from the inner ZIP names;
+ * tvVersion states it, and the installer stops before extracting anything
+ * when the two disagree or neither is known.
+ *
+ * @param {string} zipPath - Path to the TV SDK ZIP file (required)
+ * @param {boolean} force - force reinstall (default: false)
+ * @param {string} [command] - Command name for envelope
+ * @param {string} [tvVersion] - TV platform version "X.Y" the ZIP is for
+ * @returns {object} Standard JSON Envelope
+ */
+async function installTvSdkFromZip(
+  zipPath,
+  force = false,
+  command = "tizen-sdk tv-sdk-install-from-zip",
+  tvVersion = "",
+) {
+  const startTime = Date.now();
+  try {
+    // 1. Validate zipPath parameter
+    if (!zipPath || typeof zipPath !== "string") {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "ZipPath is required. Use --zip-path <path> to specify the TV SDK ZIP file.",
+        null,
+        startTime,
+      );
+    }
+    const tv = validateTizenVersion(tvVersion, { required: true });
+    if (tv.error) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `--tv-version: ${tv.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // 2. Check if Tizen SDK is installed
+    const sdkPath = readSdkPath();
+    console.error("[tizen-tv-sdk-zip] Checking if Tizen SDK is installed...");
+
+    const sdkStatus = checkSdkInstallStatus(sdkPath);
+    if (!sdkStatus.installed) {
+      console.error(
+        "[tizen-tv-sdk-zip] Tizen SDK is NOT installed. Aborting TV SDK installation.",
+      );
+      return formatError(
+        command,
+        "sdk_path_invalid",
+        "Tizen SDK is not installed. TV SDK is an extension that requires Tizen SDK to be installed first. " +
+          "Please install Tizen SDK first (use the tizen-sdk-install skill), then retry TV SDK installation. " +
+          'Ask the user: "Tizen SDK가 먼저 설치되어야 합니다. Tizen SDK 설치를 진행하시겠습니까?" ' +
+          "If the user approves, run the tizen-sdk-install skill, then retry TV SDK installation. " +
+          "If the user declines, abort.",
+        null,
+        startTime,
+      );
+    }
+    console.error(
+      `[tizen-tv-sdk-zip] Tizen SDK found at ${sdkPath}. Continuing.`,
+    );
+
+    // 3. Check if this ZIP's TV version is already installed. Other TV
+    // versions do not matter: TV 9.0 and 11.0 ZIPs install side by side.
+    const already = zipTvInstalled(sdkPath, zipPath, tv.version);
+    if (already.length > 0 && !force) {
+      console.error(
+        "[tizen-tv-sdk-zip] This TV version is already installed (recorded in .platform-installed).",
+      );
+      const warnings = [
+        `TV SDK ${already.map((p) => p.version).join(", ")} installation verified at ${sdkPath} (recorded in .platform-installed). To force a reinstall, run with --force.`,
+      ];
+      return formatTvSdkInstall(already, warnings, startTime, command);
+    }
+
+    // 4. Resolve TV SDK ZIP installer script
+    const installer = resolveScript("tizen-tv-sdk-install-from-zip");
+
+    if (!installer.scriptPath) {
+      return formatError(
+        command,
+        "execution_error",
+        `Installer script not found: ${installer.error}`,
+        null,
+        startTime,
+      );
+    }
+
+    // In pkg-compiled binary (tizen-cli), execute the installer directly.
+    // In Claude Code / Cline (non-pkg), return the installer command as
+    // suggested_fix so the agent can run it in background (Phase 2).
+    const isPkg = runsInstallerInline();
+
+    // Both paths are spliced into a shell command line below (see the
+    // rootstrap installer for why the \" replacement is not enough).
+    const unsafeZip = checkShellSafe(zipPath, "--zip-path", command, startTime);
+    if (unsafeZip) return unsafeZip;
+    const unsafeSdk = checkShellSafe(sdkPath, "SDK path", command, startTime);
+    if (unsafeSdk) return unsafeSdk;
+
+    // Build arguments
+    const winFlags = [
+      `-SdkPath "${sdkPath.replace(/\\/g, "/")}"`,
+      `-ZipPath "${zipPath.replace(/"/g, '\\"')}"`,
+    ];
+    const unixFlags = [`--sdk-path="${sdkPath}"`, `--zip-path="${zipPath}"`];
+    if (tv.version) {
+      winFlags.push(`-TvVersion ${tv.version}`);
+      unixFlags.push(`--tv-version=${tv.version}`);
+    }
+    if (force) {
+      winFlags.push("-Force");
+      unixFlags.push("--force");
+    }
+
+    if (isPkg) {
+      // Direct execution: run TV SDK ZIP installer script synchronously
+      console.error(
+        `[tizen-tv-sdk-zip] Running installer: ${installer.scriptPath}`,
+      );
+      try {
+        const winArgs = winFlags.join(" ");
+        const unixArgs = unixFlags.join(" ");
+        execPluginScript(installer.scriptPath, winArgs, unixArgs);
+        console.error("[tizen-tv-sdk-zip] Installer completed.");
+
+        // Verify installation: the installer records the ZIP's TV version
+        const packages = zipTvInstalled(sdkPath, zipPath, tv.version);
+        if (packages.length > 0) {
+          console.error(
+            "[tizen-tv-sdk-zip] TV SDK installation verified (recorded in .platform-installed).",
+          );
+          const warnings = [
+            `TV SDK installed successfully at ${sdkPath} from ${zipPath}.`,
+          ];
+          return formatTvSdkInstall(packages, warnings, startTime, command);
+        } else {
+          return formatError(
+            command,
+            "execution_error",
+            `Installer completed but ${zipPath} is not recorded in ${platformRecordPath(sdkPath)}. Installation may have failed.`,
+            null,
+            startTime,
+          );
+        }
+      } catch (installError) {
+        const failure = describeInstallerFailure(installError, {
+          what: "TV SDK installation from ZIP",
+          sdkPath,
+          logGroup: "tv-sdk-install-from-zip",
+        });
+        return formatError(
+          command,
+          "execution_error",
+          failure.message,
+          null,
+          startTime,
+          failure.details,
+        );
+      }
+    } else {
+      // Non-pkg (Claude Code / Cline / Codex): return installer command as suggested_fix
+      const installerCommand = installerFix(
+        "tizen-tv-sdk-install-from-zip",
+        installer.scriptPath,
+        winFlags.join(" "),
+        unixFlags.join(" "),
+      );
+
+      return formatError(
+        command,
+        "install_required",
+        "TV SDK is NOT installed. This pre-check CLI cannot install it. " +
+          harnessGuidance("detach") +
+          "Either way, afterwards re-run this CLI with the same --zip-path (and --tv-version) to verify the TV version is recorded in <sdk-path>/.platform-installed. " +
+          "Do NOT re-run this CLI to install — --force only skips the already-installed check.",
+        installerCommand,
+        startTime,
+      );
+    }
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install TV SDK from ZIP: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+module.exports = {
+  CONFIG_FILE,
+  runsInstallerInline,
+  buildJobCommand,
+  installerFix,
+  installerPathArgs,
+  harnessGuidance,
+  sdkPrecheckRerunHint,
+  DEFAULT_SDK_PATH,
+  initSdk,
+  getSdkStatus,
+  collectInstalledPackages,
+  installedPackageSummary,
+  platformPayloadProfiles,
+  readPlatformRecords,
+  recordedPlatformProfiles,
+  installedPlatformEntries,
+  isTvVersionRecorded,
+  installedTizenPlatformVersions,
+  ensureSdkPathConfig,
+  validateTizenVersion,
+  listInstalledPlatformVersions,
+  isPlatformInstalled,
+  isTizenPlatformInstalled,
+  listFullyInstalledPlatformVersions,
+  requestedPlatformMissing,
+  describeInstallerFailure,
+  describeChildExit,
+  installerLogsDir,
+  outputTailLines,
+  sdkInstallerFlags,
+  downloadJobsFlags,
+  installSdk,
+  installSdkFromRepo,
+  validateRepoUrl,
+  normalizeRepoUrl,
+  checkRepoUrlSyntax,
+  readInstalledRepository,
+  installTvSdk,
+  updatePackage,
+  UPDATE_RESULT_MARKER,
+  UPDATE_RESULT_MAX_AGE_MS,
+  parseUpdateResultMarker,
+  isUpdateResultFresh,
+  updateResultSatisfies,
+  getRepoInfo,
+  downloadEmulatorPackage,
+  // Exported for tests
+  parseEmulatorMarkerPlatforms,
+  isEmulatorMarkerSatisfied,
+  listInstalledEmulatorImages,
+  describeEmulatorImages,
+  comparePlatformVersions,
+  installPlatform,
+  listPlatforms,
+  downloadMobilePlatform,
+  installRootstrap,
+  parseRootstrapMarker,
+  installTvSdkFromZip,
+  readSdkPath,
+  checkSdkInstallStatus,
+  repairSdkInfo,
+  describeSdkInfoRepair,
+  checkSdkInstallationViaScript,
+  checkIfSdkAlreadyInstalled,
+};

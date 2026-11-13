@@ -1,0 +1,2914 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Samsung Electronics Co., Ltd.
+
+/**
+ * Emulator domain: the full em-cli surface for emulator VMs
+ *
+ * Supports:
+ *   - create:        Create a VM with configurable platform, template, profile, and hardware
+ *   - delete:        Delete a VM
+ *   - launch:        Launch a VM and wait for it to connect via sdb
+ *   - list-platform: List available emulator platform images
+ *   - list-template: List available templates for a platform
+ *   - list-vm:       List existing emulator VMs
+ *   - detail:        Print one VM's configuration, or the emulator manager's own info
+ *   - modify:        Change an existing VM's template, RAM, skin, sharing, or acceleration
+ *   - reset:         Format a VM's disk image (destructive — gated behind opts.confirm)
+ *   - create-image:  Capture a VM's disk as a reusable platform image
+ *
+ * manageEmulator() is the single entry point covering all of the above.
+ * createEmulator() and launchEmulator() remain as the narrower, long-standing
+ * entry points that tizen-cli's create-emulator/launch-emulator commands call.
+ *
+ * Executes scripts/tizen-emulator-manager and parses stdout to return Standard JSON Envelope.
+ */
+
+const { formatError } = require("../envelope/response-formatter");
+const { Envelope } = require("../envelope/envelope");
+const { resolveScript, execPluginScript } = require("./plugin-cache");
+const { summarizeOutput } = require("./output-summary");
+
+/**
+ * Screen size used when the caller does not ask for one.
+ * "1080" resolves to the 1920x1080 template of the target profile.
+ */
+const DEFAULT_SIZE = "1080";
+
+/**
+ * Values em-cli accepts for its enum-ish flags.
+ *
+ * These are screened here, not only in the script, because buildEmulatorArgs()
+ * renders every option into the single shell command line that execPluginScript()
+ * hands to execSync. Anything injected there runs BEFORE the script starts, so
+ * the script's own validation cannot be the boundary that protects it.
+ */
+const ENUM_OPTIONS = {
+  skin: ["1", "2"],
+  ramSize: ["512", "768", "1024"],
+  hwVirtualization: ["yes", "no"],
+  hwGlAcceleration: ["yes", "no"],
+};
+
+/**
+ * Path-valued options, which reach the script inside double quotes.
+ */
+const PATH_OPTIONS = [
+  "fileSharingPath",
+  "customPath",
+  "rawImagePath",
+  "outputDir",
+  "emulatorPath",
+];
+
+/**
+ * Characters that would end the double-quoted argument a path is rendered into,
+ * or start a substitution inside it. Everything else — spaces, drive letters,
+ * non-ASCII directory names — is left alone so real paths still work.
+ */
+const SHELL_METACHARACTERS = /["'`$;&|<>(){}[\]!*?\r\n\t]/;
+const SHELL_METACHARACTER_LIST = "\" ' ` $ ; & | < > ( ) { } [ ] ! * ?";
+
+/**
+ * Template names may contain spaces, so they get their own allow-list rather
+ * than the path screen.
+ */
+const TEMPLATE_PATTERN = /^[A-Za-z0-9._\s-]+$/;
+
+/** VM and platform names are plain identifiers — no spaces, no punctuation. */
+const NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * Screen the options that are interpolated into the script command line.
+ *
+ * vmName / platform / template have always been validated at their call sites;
+ * this covers the hardware, path, and timeout options that are passed through.
+ *
+ * @param {object} opts
+ * @param {string} command
+ * @returns {object|null} An error envelope, or null when every option is safe
+ */
+function validatePassThroughOptions(opts, command) {
+  for (const [key, allowed] of Object.entries(ENUM_OPTIONS)) {
+    const value = opts[key];
+    if (value === undefined || value === null || value === "") continue;
+    if (!allowed.includes(String(value))) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid ${key}: ${value}. em-cli accepts ${allowed.join(", ")}.`,
+      );
+    }
+  }
+
+  for (const key of PATH_OPTIONS) {
+    const value = opts[key];
+    if (value === undefined || value === null || value === "") continue;
+    const text = String(value);
+    // A trailing backslash would escape the closing quote: bash reads "C:\" as
+    // an unterminated string and swallows the rest of the command line.
+    if (SHELL_METACHARACTERS.test(text) || text.endsWith("\\")) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid ${key}: ${text}. A path must not end with a backslash or contain ` +
+          `any of these characters: ${SHELL_METACHARACTER_LIST}`,
+      );
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Machine-readable output lines of the emulator scripts. Each of these is
+ * parsed into a structured field elsewhere (result fields, LAUNCH_DIAG via
+ * parseLaunchDiagnostics, HOMESCREEN_STATUS via parseHomescreenStatus), so repeating
+ * them as text would duplicate every finding. Shared by
+ * summarizeEmulatorOutput() and rawOutputTail() so both views filter the
+ * SAME set — a machine line must never resurface as a warning or a `raw:`
+ * evidence line.
+ */
+const MACHINE_LINE =
+  /^(EMULATOR_|VM_|PLATFORM_|TEMPLATE_|LAUNCH_DIAG=|LAUNCH_WARN=|HOMESCREEN_STATUS=|HW_VIRT_AUTOFIX=|SDB_SERVER_RESTARTED=|EMCLI_MISMATCH=|EMCLI_EXIT=|EMCLI_OUTPUT_BEGIN|EMCLI_OUTPUT_END|VM_LIST|PLATFORM_LIST|TEMPLATE_LIST)/;
+
+/**
+ * Summarize em-cli output for envelope warnings
+ */
+function summarizeEmulatorOutput(output) {
+  return summarizeOutput(output, {
+    keep: /warn|error|fail|manual|em-cli|jna|qemu|platform|template|created|deleted|launch|kvm|virtualiz|xcb|ldd|not found|emulator\.log/i,
+    skip: MACHINE_LINE,
+    max: 15,
+  });
+}
+
+/**
+ * Signature of em-cli dying inside its own Java runtime (missing JNA native
+ * bridge, missing classes, broken JVM) rather than reporting a VM problem.
+ * The JVM prints qualified class names, and the plugin scripts' own warnings
+ * say "Java/JNA", so both are covered.
+ *
+ * SINGLE SOURCE for Java/JNA detection: doctor.ts imports this constant, and
+ * the `grep -qiE` in tizen-emulator-manager.sh launch_vm() carries a literal
+ * copy of the same alternation (the shell cannot import it) — the test suite
+ * compares the two token-for-token, so change them together.
+ */
+const JAVA_JNA_PATTERN =
+  /jna|NoClassDefFoundError|UnsatisfiedLinkError|ClassNotFoundException|NoSuchFieldError|NoSuchMethodError|ExceptionInInitializerError|java\.lang\.|Could not create the Java Virtual Machine|Error occurred during initialization of VM|java: command not found/i;
+
+/**
+ * Subset of JAVA_JNA_PATTERN with a different root cause: NoSuchFieldError /
+ * NoSuchMethodError means a class LOADED but its members do not match what the
+ * caller was compiled against — an emulator-manager core vs platform emulator
+ * plugin VERSION MISMATCH, not a missing dependency. Real case:
+ * `java.lang.NoSuchFieldError: isVirgl` launching tizen-11.0, fixed by
+ * tizen-update-package taking emulator-manager 2.6.60 → 2.6.67. The fix is the
+ * update-package flow, so javaJnaHint must not send these to a JNA reinstall.
+ */
+const JAVA_VERSION_MISMATCH_PATTERN = /NoSuchFieldError|NoSuchMethodError/i;
+
+/**
+ * Guidance for a Java/JNA em-cli crash.
+ *
+ * Issue #40: the old hint ("launch an emulator manually via Tizen Studio
+ * Emulator Manager") assumed a human at a GUI on the SDK host — exactly what a
+ * headless MCP client cannot satisfy. Point at the raw output now carried in
+ * details, and at fixes that work over a shell.
+ */
+function javaJnaHint(output) {
+  if (!JAVA_JNA_PATTERN.test(output)) return "";
+  if (JAVA_VERSION_MISMATCH_PATTERN.test(output)) {
+    return (
+      " em-cli (a Java tool) crashed with a NoSuchFieldError/NoSuchMethodError before it could touch the VM —" +
+      " its emulator-manager core and the platform's emulator plugin are at mismatched versions" +
+      " (e.g. java.lang.NoSuchFieldError: isVirgl), not a missing dependency." +
+      " The raw em-cli output is in the error details — check it for the exact Java error." +
+      " Fix on the SDK host: update the SDK packages (tizen-update-package) so emulator-manager and the" +
+      " platform plugins match again. Run 'doctor' to re-check em-cli health after updating."
+    );
+  }
+  return (
+    " em-cli (a Java tool) crashed with a Java/JNA dependency error before it could touch the VM." +
+    " The raw em-cli output is in the error details — check it for the exact Java error." +
+    " Typical fixes on the SDK host: reinstall the emulator package (download-emulator-package," +
+    " it restores the JNA jar), and verify the SDK's bundled JRE runs." +
+    " Run 'doctor' to re-check em-cli health after fixing."
+  );
+}
+
+/**
+ * The part of a script's captured output that em-cli itself printed.
+ *
+ * report_emcli_failure / Report-EmCliFailure wrap the raw em-cli output in
+ * EMCLI_OUTPUT_BEGIN / EMCLI_OUTPUT_END marker lines. Only that part may feed
+ * JAVA_JNA_PATTERN: the scripts' own diagnostics used to say "Java/JNA" and
+ * "NoClassDefFoundError", so every failure — including a sandboxed em-cli that
+ * printed nothing — was reported as a JNA crash (issue #82). Output from an
+ * older script without markers is returned whole, minus lines that are
+ * visibly the script's own ([WARN]/[INFO]/[ERROR] prefixed).
+ *
+ * @param {string} scriptOutput
+ * @returns {string}
+ */
+function emcliOutputOf(scriptOutput) {
+  const text = String(scriptOutput || "");
+  const blocks = [];
+  const re = /^EMCLI_OUTPUT_BEGIN\r?\n([\s\S]*?)^EMCLI_OUTPUT_END/gm;
+  let m;
+  while ((m = re.exec(text)) !== null) blocks.push(m[1]);
+  if (blocks.length) return blocks.join("\n");
+  if (/^EMCLI_OUTPUT_BEGIN/m.test(text)) return "";
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/^\[(WARN|INFO|ERROR|OK)\]/.test(line.trim()))
+    .join("\n");
+}
+
+/**
+ * em-cli exited (EMCLI_EXIT=<rc> machine line) but printed nothing: the JVM
+ * never got to run — a sandbox/permission policy killed or blocked it, or it
+ * could not start. Distinct from a Java stack trace, which javaJnaHint covers.
+ *
+ * @param {string} scriptOutput
+ * @returns {string} sentence starting with a space, or ""
+ */
+function emcliExitHint(scriptOutput) {
+  const text = String(scriptOutput || "");
+  const exit = text.match(/^EMCLI_EXIT=(\d+)$/m);
+  if (!exit) return "";
+  if (emcliOutputOf(text).trim()) return "";
+  const rc = exit[1];
+  return (
+    ` em-cli exited with code ${rc} without printing anything — it was blocked before it could run ` +
+    "(a sandbox or permission policy: under Codex CLI re-run this command with escalated permissions" +
+    (rc === "124"
+      ? "; 124 means it hit the em-cli wall-clock cap, i.e. a hung JVM"
+      : "") +
+    "), or the SDK's bundled JRE could not start. Run 'doctor' to re-check em-cli health."
+  );
+}
+
+/**
+ * Suggested fix for an emulator-manager core vs platform emulator plugin
+ * version mismatch (NoSuchFieldError/NoSuchMethodError, real case
+ * java.lang.NoSuchFieldError: isVirgl): update the SDK packages, then retry
+ * the exact create that failed. The update is deliberately NOT executed here —
+ * it can download hundreds of MB of emulator images (minutes), so it must run
+ * through the update-package flow instead of blocking inside this call. Note
+ * for the caller: the update overwrites the platform's emulator-v2/bin host
+ * libraries, so any manual workarounds there must be re-applied.
+ */
+function versionMismatchFix(action, opts = {}) {
+  const update =
+    "node update-package-cli.js (long-running package download — run it in the background)";
+  if (action !== "create") {
+    return `${update}, then retry the failed '${action}' once`;
+  }
+  const retry = ["node emulator-manager-cli.js create"];
+  if (opts.vmName) retry.push(`--vm-name ${opts.vmName}`);
+  if (opts.platform) retry.push(`--platform ${opts.platform}`);
+  if (opts.profile && opts.profile !== "tizen")
+    retry.push(`--profile ${opts.profile}`);
+  if (opts.template) retry.push(`--template "${opts.template}"`);
+  else if (opts.size) retry.push(`--size ${opts.size}`);
+  if (opts.launch) retry.push("--launch");
+  return `${update}, then retry once: ${retry.join(" ")}`;
+}
+
+/**
+ * Last lines of the raw script output, for the error envelope's details.
+ *
+ * Issue #40: a remote MCP client cannot read the temp file on the SDK host
+ * (execPluginScript deletes it after reading anyway), so the categorised
+ * message was all it ever saw — not enough to tell a missing native library
+ * from a JVM version mismatch. This carries the untouched tail of
+ * stdout+stderr, truncated per line, so the original stack trace survives
+ * into the payload. MACHINE_LINE entries are dropped — they already reach
+ * the caller through the structured fields, and the filter is the same set
+ * summarizeEmulatorOutput() skips, so the two views stay consistent.
+ */
+function rawOutputTail(output, { maxLines = 20, maxLineLength = 300 } = {}) {
+  const lines = String(output || "")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\r$/, "").trim())
+    .filter((line) => line && !MACHINE_LINE.test(line));
+  const tail = lines
+    .slice(-maxLines)
+    .map((line) => {
+      if (line.length <= maxLineLength) return line;
+      // Never split a surrogate pair at the cut: JSON.stringify escapes a lone
+      // surrogate into valid JSON, but it reaches the client as garbage.
+      let cut = maxLineLength;
+      const boundary = line.charCodeAt(cut - 1);
+      if (boundary >= 0xd800 && boundary <= 0xdbff) cut -= 1;
+      return `${line.slice(0, cut)} ...`;
+    })
+    .map((line) => `raw: ${line}`);
+  if (lines.length > maxLines) {
+    tail.unshift(
+      `raw: ... (${lines.length - maxLines} earlier line(s) omitted)`,
+    );
+  }
+  return tail;
+}
+
+/**
+ * Parse LAUNCH_DIAG=<key>|<value> lines emitted by diagnose_launch_failure()
+ * in tizen-emulator-manager.sh into a structured diagnosis.
+ *
+ * @param {string} output - combined script stdout/stderr
+ * @returns {{phase: string|null, vm: string|null, hw_virtualization: string|null,
+ *   kvm: string|null, kvm_writable: string|null, cpu_virt_flags: string|null,
+ *   missing_libs: string[], missing_qt_libs: string[], qt_xcb: boolean,
+ *   qt_display: boolean, display: string|null, display_socket_missing: boolean,
+ *   xcb_packages: string|null, java_jna: boolean, wsl: boolean,
+ *   emulator_log: string|null, log_tail: string[], suggestions: string[],
+ *   fixes: string[]} | null}
+ *   null when the output carries no LAUNCH_DIAG lines (old script, or the
+ *   failure never reached the diagnosis stage).
+ */
+function parseLaunchDiagnostics(output) {
+  const diag = {
+    phase: null,
+    vm: null,
+    hw_virtualization: null,
+    kvm: null,
+    kvm_writable: null,
+    cpu_virt_flags: null,
+    missing_libs: [],
+    missing_qt_libs: [],
+    qt_xcb: false,
+    qt_display: false,
+    display: null,
+    display_socket_missing: false,
+    xcb_packages: null,
+    java_jna: false,
+    wsl: false,
+    emulator_log: null,
+    log_tail: [],
+    suggestions: [],
+    fixes: [],
+  };
+  let seen = false;
+  for (const line of String(output || "").split(/\r?\n/)) {
+    const m = line.match(/^LAUNCH_DIAG=(.+?)\|(.*)$/);
+    if (!m) continue;
+    seen = true;
+    const [, key, value] = m;
+    switch (key) {
+      case "phase":
+        diag.phase = value;
+        break;
+      case "vm":
+        diag.vm = value;
+        break;
+      case "hw_virtualization":
+        diag.hw_virtualization = value;
+        break;
+      case "kvm":
+        diag.kvm = value;
+        break;
+      case "kvm_writable":
+        diag.kvm_writable = value;
+        break;
+      case "cpu_virt_flags":
+        diag.cpu_virt_flags = value;
+        break;
+      case "missing_libs":
+        diag.missing_libs = value.split(",").filter(Boolean);
+        break;
+      case "missing_qt_libs":
+        diag.missing_qt_libs = value.split(",").filter(Boolean);
+        break;
+      case "qt_xcb":
+        diag.qt_xcb = value === "failed";
+        break;
+      case "qt_display":
+        diag.qt_display = value === "failed";
+        break;
+      case "display":
+        diag.display = value;
+        break;
+      case "display_socket":
+        diag.display_socket_missing = value === "missing";
+        break;
+      case "xcb_packages":
+        diag.xcb_packages = value;
+        break;
+      case "java_jna":
+        diag.java_jna = value === "failed";
+        break;
+      case "wsl":
+        diag.wsl = value === "yes";
+        break;
+      case "emulator_log":
+        diag.emulator_log = value;
+        break;
+      case "log":
+        diag.log_tail.push(value);
+        break;
+      case "suggest":
+        diag.suggestions.push(value);
+        break;
+      case "fix":
+        diag.fixes.push(value);
+        break;
+      default:
+        break;
+    }
+  }
+  return seen ? diag : null;
+}
+
+/**
+ * Render a parsed launch diagnosis into the error envelope's details array.
+ *
+ * The consolidated host-fix guide goes FIRST — it is the "what do I do now"
+ * answer (ordered, copy-pasteable commands assembled by the script from its
+ * own findings); everything after it is the evidence. Shared by the launch
+ * action and the create --launch path so both failures read the same.
+ *
+ * @param {object} diag - parseLaunchDiagnostics() result (non-null)
+ * @param {string} combined - raw script stdout+stderr for the evidence tail
+ * @returns {string[]}
+ */
+function launchDiagnosisDetails(diag, combined) {
+  return [
+    `phase: ${diag.phase || "unknown"}`,
+    ...(diag.fixes.length > 0
+      ? [
+          "HOST FIX REQUIRED — run these in order, then relaunch:",
+          ...diag.fixes.map((f) => `  ${f}`),
+        ]
+      : []),
+    diag.java_jna &&
+      "em-cli crashed inside its own Java runtime (JNA) before the VM could start — the emulator never ran. " +
+        "Reinstall the emulator package (download-emulator-package) and verify the SDK's bundled JRE; " +
+        "a NoSuchFieldError/NoSuchMethodError instead means an emulator-manager vs platform-plugin version " +
+        "mismatch — update the SDK packages (tizen-update-package); " +
+        "the exact Java error is in the raw: lines below.",
+    diag.wsl &&
+      `Running in WSL — ensure Windows .wslconfig has nestedVirtualization=true under [interop] or [experimental]`,
+    diag.hw_virtualization !== null &&
+      `vm_config hwVirtualization: ${diag.hw_virtualization}`,
+    diag.kvm &&
+      `/dev/kvm: ${diag.kvm}${diag.kvm_writable ? ` (writable: ${diag.kvm_writable})` : ""}`,
+    diag.kvm === "missing" &&
+      diag.cpu_virt_flags !== null &&
+      `cpu virtualization flags (vmx/svm) in /proc/cpuinfo: ${diag.cpu_virt_flags}`,
+    diag.missing_libs.length > 0 &&
+      `missing libraries: ${diag.missing_libs.join(", ")} — install the matching host packages (libasound2, libsdl1.2debian, libv4l-0, libxcb-*)`,
+    diag.missing_qt_libs.length > 0 &&
+      `Qt xcb plugin missing libraries: ${diag.missing_qt_libs.join(", ")} — the host-fix steps above name the packages`,
+    diag.display === "missing" &&
+      "DISPLAY is not set — the emulator GUI has no X server to open on (common in SSH sessions; WSLg sets DISPLAY=:0)",
+    diag.display &&
+      diag.display !== "missing" &&
+      diag.display_socket_missing &&
+      `DISPLAY=${diag.display} is set but its X socket does not exist — no X server is listening (WSLg off, or X not running)`,
+    diag.qt_display &&
+      "Qt could not connect to an X display — a DISPLAY/WSLg problem, not a missing package",
+    diag.qt_xcb &&
+      diag.xcb_packages !== "installed" &&
+      "Qt xcb platform plugin failed to LOAD (file found, deps unmet) — install libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxkbcommon-x11-0",
+    diag.qt_xcb &&
+      diag.xcb_packages === "installed" &&
+      "Qt xcb platform plugin failed to LOAD, but the xcb runtime packages are all installed — the cause is elsewhere (see the DISPLAY and missing-library findings)",
+    ...diag.log_tail.map((l) => `emulator.log: ${l}`),
+    // The untouched script output tail — the structured lines above are
+    // an interpretation, this is the evidence (issue #40).
+    ...rawOutputTail(combined, { maxLines: 10 }),
+  ].filter(Boolean);
+}
+
+/**
+ * The one-command suggested_fix for a launch diagnosis, when there is one.
+ * Prefers the script-resolved VM name: on a no-name launch the script picks
+ * the first VM itself, so the caller's own vmName may be empty.
+ */
+function launchDiagnosisSuggestedFix(diag, vmName) {
+  return diag.suggestions.includes("enable_hw_virtualization")
+    ? `node emulator-manager-cli.js modify --vm-name ${diag.vm || vmName || "<vm>"} --hw-virtualization yes`
+    : null;
+}
+
+/**
+ * Parse the HW_VIRT_AUTOFIX=<vm> line emitted by maybe_enable_hw_virtualization()
+ * in tizen-emulator-manager.sh — the pre-launch auto-heal that re-enables
+ * hwVirtualization on a VM whose profile disabled it while host KVM is usable.
+ *
+ * @param {string} output - combined script stdout/stderr
+ * @returns {string|null} The healed VM's name, or null when no fix was applied.
+ */
+function parseHwVirtAutofix(output) {
+  const m = String(output || "").match(/^HW_VIRT_AUTOFIX=(.+)$/m);
+  return m ? m[1].trim() : null;
+}
+
+/**
+ * Warning text for a HW_VIRT_AUTOFIX report — shared by the launch and
+ * create --launch paths so both envelopes describe the heal identically.
+ *
+ * Every claim here is gated by maybe_enable_hw_virtualization() in
+ * tizen-emulator-manager.sh, which only emits HW_VIRT_AUTOFIX when the host is
+ * Linux, $KVM_DEVICE exists and is writable, the profile really said false, AND
+ * the em-cli modify was verified to have taken (em-cli lies in both directions,
+ * so the script double-checks). Keep the two in sync: this is the only text the
+ * user sees, and it is unit-tested for exactly that reason.
+ */
+function hwVirtAutofixWarning(vm) {
+  return (
+    `VM '${vm}' had CPU virtualization disabled in its profile ` +
+    `(<hwVirtualization>false</hwVirtualization> — em-cli writes that when KVM was ` +
+    `inaccessible at create time). Host KVM is usable, so it was auto-enabled before ` +
+    `launch (em-cli modify -n ${vm} -w yes). No action needed; this is a one-time fix.`
+  );
+}
+
+/**
+ * Parse LAUNCH_WARN=<key> lines emitted on an otherwise SUCCESSFUL launch
+ * (see warn_if_virgl_scanout_failing in tizen-emulator-manager.sh).
+ * Deliberately a separate prefix from LAUNCH_DIAG: those are failure-path
+ * keys whose script/parser sync is enforced by the key-sync test, while these
+ * ride along with DEVICE_SERIAL on the success path.
+ *
+ * @param {string} output - combined script stdout/stderr
+ * @returns {string[]} warning keys, in emission order
+ */
+function parseLaunchWarnings(output) {
+  return [...String(output || "").matchAll(/^LAUNCH_WARN=([a-z_]+)$/gm)].map(
+    (m) => m[1],
+  );
+}
+
+/**
+ * The user-facing text for a LAUNCH_WARN key. An unknown key still surfaces —
+ * a warning the script bothered to emit must never vanish just because this
+ * map lags behind it.
+ */
+function launchWarningText(key) {
+  switch (key) {
+    case "virgl_scanout_failing":
+      return (
+        "The VM log is flooding with virgl scanout failures (virtio_gpu error 0x1203): the host " +
+        "virglrenderer cannot handle this platform's GL scanout, so the emulator window may show " +
+        "'Display output is not active' or stay black even though boot and sdb succeeded. " +
+        "Host virglrenderer >= 1.0 is required."
+      );
+    default:
+      return `Launch warning from the emulator script: ${key}`;
+  }
+}
+
+/**
+ * The home screen binary the WSL fix execs directly, bypassing launchpad.
+ * KEEP IN SYNC with HOMESCREEN_RUNNER in tizen-emulator-manager.sh.
+ */
+const HOMESCREEN_RUNNER = "/usr/apps/org.tizen.homescreen/bin/runner";
+
+/**
+ * The single source of truth for what a home screen fix result means to the
+ * user. Both callers (launchEmulator and the fix-homescreen action) use this, so
+ * the two can never drift apart, and every branch is unit-tested — the prose
+ * here is the only place the behaviour is explained, and a stale claim in it
+ * (an earlier version blamed WSL's 9p filesystem, which was wrong) reaches the
+ * user directly.
+ *
+ * Deliberately does NOT name the env vars as the cause of `detected`: that state
+ * is also reached via the retired TIZEN_BUXTON_AUTOFIX=0 opt-out, so naming
+ * TIZEN_HOMESCREEN_* would point at variables the caller never set. The script's
+ * own log says which knob applied.
+ *
+ * @param {"ok"|"detected"|"fixed"|"popup_fixed"|"fix_failed"|null} status
+ * @param {object} opts
+ * @param {string} [opts.serial] - device serial, for copy-pasteable commands
+ * @param {string} [opts.vmName] - VM name, for the TV-profile suggestion
+ * @param {boolean} [opts.explicit] - true when the user asked for the fix
+ *   directly (the action). Then "nothing to do" outcomes are worth reporting;
+ *   on a plain launch they are noise.
+ * @returns {string|null} warning text, or null when there is nothing to say
+ */
+function homescreenFixWarning(
+  status,
+  { serial, vmName, explicit = false } = {},
+) {
+  const sdb = `sdb${serial ? ` -s ${serial}` : ""}`;
+  const restore = `${sdb} shell "systemctl --global unmask starter.service starter.path"`;
+
+  switch (status) {
+    case "fixed":
+      return (
+        "The home screen was crash-looping (on Linux the Flutter home screen fails EGL config " +
+        "selection when launched through launchpad) and this was fixed: starter's user units " +
+        'were masked and stopped so its retry loop and its "Unable to launch" popup stop, the ' +
+        `accumulated crash dumps were deleted to free /opt, and ${HOMESCREEN_RUNNER} was started ` +
+        "directly. Two caveats: it runs as root rather than the session user, so behaviour that " +
+        "depends on the user session may differ; and it does not survive a guest reboot, so the " +
+        `launch flow re-applies it. To restore stock behaviour: ${restore} and reboot the guest.`
+      );
+    case "popup_fixed":
+      return (
+        "The home screen was crash-looping and its retry loop was stopped (starter masked, crash " +
+        "dumps cleared to free /opt), but the home screen itself was not started, so the display " +
+        "stays empty until you launch an app. App development is unaffected: " +
+        `${sdb} shell app_launcher -l, then app_launcher -s <app-id>. To restore stock ` +
+        `behaviour: ${restore} and reboot the guest.`
+      );
+    case "detected":
+      return (
+        "The home screen is crash-looping and this was only reported — the fixes are switched off " +
+        "(see the script log above for which setting applied). Left alone, starter keeps retrying, " +
+        'shows "Unable to launch org.tizen.homescreen." and the crash dumps fill /opt until ' +
+        `unrelated things start failing (check: ${sdb} shell df -h /opt). App development still ` +
+        "works without the home screen."
+      );
+    case "fix_failed":
+      return (
+        "The home screen is crash-looping and could not be brought up. Its retry loop and popup " +
+        "are stopped, so app development still works: installs/launches via sdb are unaffected " +
+        `(verify by launching an installed app — list them with ${sdb} shell app_launcher -l; ` +
+        "preinstalled UG/panel components may not open standalone windows, so test with a real " +
+        "app). For a home-screen UI that works unattended, switch to the TV profile: " +
+        `em-cli delete -n ${vmName || "<vm>"}, then re-create it with -p tv.`
+      );
+    case "ok":
+      return explicit
+        ? "No home screen crash loop found — nothing needed fixing and the guest was left untouched."
+        : null;
+    case null:
+    case undefined:
+      return explicit
+        ? "The home screen fix did not apply to this target and nothing was changed. It is " +
+            "verified only for the standard tizen emulator profile on Linux (WSL or native " +
+            "Linux), so it is skipped for real devices, TV/wearable images and non-Linux hosts " +
+            "(the script log above says which gate stopped it). TIZEN_HOMESCREEN_CHECK=force runs " +
+            "it anyway — unverified elsewhere."
+        : null;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Parse the HOMESCREEN_STATUS=<status> line emitted by
+ * check_and_fix_homescreen() in tizen-emulator-manager.sh — the post-launch
+ * check that detects the Linux (WSL / remote) home screen crash loop (Flutter
+ * home screen fails EGL config selection when launched through launchpad), stops
+ * starter's retry loop and popup, and starts the home screen directly.
+ *
+ * @param {string} output - combined script stdout/stderr
+ * @returns {"ok"|"detected"|"fixed"|"popup_fixed"|"fix_failed"|null} null when
+ *   the check did not apply (non-Linux host, non-emulator target, non-tizen
+ *   platform, TIZEN_HOMESCREEN_CHECK=off, or an older script).
+ */
+function parseHomescreenStatus(output) {
+  const m = String(output || "").match(
+    /^HOMESCREEN_STATUS=(ok|detected|fixed|popup_fixed|fix_failed)$/m,
+  );
+  return m ? m[1] : null;
+}
+
+/**
+ * Build the platform-specific script arguments for one emulator action.
+ *
+ * @returns {{winArgs: string[], unixArgs: string[]}}
+ */
+function buildEmulatorArgs({
+  action,
+  profile,
+  vmName,
+  platform,
+  template,
+  launch,
+  skin,
+  ramSize,
+  fileSharingPath,
+  hwVirtualization,
+  hwGlAcceleration,
+  customPath,
+  rawImagePath,
+  outputDir,
+  compress,
+  detail,
+  count,
+  timeoutSec,
+  emulatorPath,
+}) {
+  const winArgs = [`-Action ${action}`, `-Profile ${profile}`];
+  const unixArgs = [`-a ${action}`, `-p ${profile}`];
+
+  if (vmName) {
+    winArgs.push(`-VmName "${vmName}"`);
+    unixArgs.push(`-n "${vmName}"`);
+  }
+  if (platform) {
+    winArgs.push(`-Platform "${platform}"`);
+    unixArgs.push(`-P "${platform}"`);
+  }
+  if (template) {
+    winArgs.push(`-Template "${template}"`);
+    unixArgs.push(`-T "${template}"`);
+  }
+  if (launch) {
+    winArgs.push(`-Launch`);
+    unixArgs.push(`-l`);
+  }
+  if (skin) {
+    winArgs.push(`-Skin ${skin}`);
+    unixArgs.push(`-s ${skin}`);
+  }
+  if (ramSize) {
+    winArgs.push(`-RamSize ${ramSize}`);
+    unixArgs.push(`-r ${ramSize}`);
+  }
+  if (fileSharingPath) {
+    winArgs.push(`-FileSharingPath "${fileSharingPath}"`);
+    unixArgs.push(`-f "${fileSharingPath}"`);
+  }
+  if (hwVirtualization) {
+    winArgs.push(`-HwVirtualization ${hwVirtualization}`);
+    unixArgs.push(`-w ${hwVirtualization}`);
+  }
+  if (hwGlAcceleration) {
+    winArgs.push(`-HwGlAcceleration ${hwGlAcceleration}`);
+    unixArgs.push(`-g ${hwGlAcceleration}`);
+  }
+  if (customPath) {
+    winArgs.push(`-CustomPath "${customPath}"`);
+    unixArgs.push(`-c "${customPath}"`);
+  }
+  if (rawImagePath) {
+    winArgs.push(`-RawImagePath "${rawImagePath}"`);
+    unixArgs.push(`-R "${rawImagePath}"`);
+  }
+  if (outputDir) {
+    winArgs.push(`-OutputDir "${outputDir}"`);
+    unixArgs.push(`-o "${outputDir}"`);
+  }
+  if (compress) {
+    winArgs.push(`-Compress`);
+    unixArgs.push(`-z`);
+  }
+  if (detail) {
+    winArgs.push(`-Detail`);
+    unixArgs.push(`-d`);
+  }
+  if (count) {
+    winArgs.push(`-Count`);
+    unixArgs.push(`-C`);
+  }
+  if (timeoutSec) {
+    winArgs.push(`-Timeout ${timeoutSec}`);
+    unixArgs.push(`-t ${timeoutSec}`);
+  }
+  if (emulatorPath) {
+    winArgs.push(`-EmulatorPath "${emulatorPath}"`);
+    unixArgs.push(`-E "${emulatorPath}"`);
+  }
+
+  return { winArgs, unixArgs };
+}
+
+/**
+ * Run the emulator script for one action and return its stdout.
+ */
+/** Actions that only read em-cli state; a hang there is a broken host, not work. */
+const READ_ONLY_EMCLI_ACTIONS = [
+  "list-vm",
+  "list-platform",
+  "list-template",
+  "detail",
+];
+
+/**
+ * Wall-clock cap for read-only script runs. The scripts already cap each
+ * em-cli call (TIZEN_EMCLI_TIMEOUT / TIZEN_EMCLI_TIMEOUT_MS, 120 s); this is
+ * the outer safety net so a hung JVM (issue #82, Windows list-vm) yields an
+ * envelope instead of execPluginScript's 30-minute default.
+ */
+const READ_ONLY_SCRIPT_TIMEOUT_MS =
+  parseInt(process.env.TIZEN_EMCLI_LIST_TIMEOUT_MS, 10) || 180000;
+
+function runEmulatorScript(scriptPath, args) {
+  const { winArgs, unixArgs } = buildEmulatorArgs(args);
+  const readOnly = READ_ONLY_EMCLI_ACTIONS.includes(args && args.action);
+  return execPluginScript(scriptPath, winArgs.join(" "), unixArgs.join(" "), {
+    captureViaTempFile: true,
+    ...(readOnly ? { timeout: READ_ONLY_SCRIPT_TIMEOUT_MS } : {}),
+  });
+}
+
+/**
+ * Parse the TEMPLATE_DETAIL= lines emitted by the list-template action into
+ * template records. em-cli repeats some templates, so duplicates by name are
+ * dropped (first wins).
+ *
+ * Each line is `TEMPLATE_DETAIL=<name>|<profile>|<resolution>|<ram>`.
+ *
+ * @param {string} output - Raw script stdout
+ * @returns {Array<{name: string, profile: string, resolution: string, size: string, ram: string}>}
+ */
+function parseTemplateDetails(output) {
+  if (!output) return [];
+
+  const seen = new Set();
+  const details = [];
+
+  for (const line of String(output).split(/\r?\n/)) {
+    const match = line.match(/^TEMPLATE_DETAIL=(.*)$/);
+    if (!match) continue;
+
+    const [name, profile, resolution, ram] = match[1].split("|");
+    const trimmedName = (name || "").trim();
+    if (!trimmedName || seen.has(trimmedName)) continue;
+
+    // em-cli prints its errors ("Error: foo does not match any platform") as
+    // unindented lines, which look exactly like a template name to the block
+    // parser. A real template always reports a WxH resolution, so require one
+    // — otherwise a failed lookup turns into a bogus zero-size "template" and
+    // the caller gets "size not available" instead of the actual error.
+    const trimmedResolution = (resolution || "").trim();
+    if (!/^\d{3,5}\s*[xX]\s*\d{3,5}$/.test(trimmedResolution)) continue;
+
+    seen.add(trimmedName);
+
+    details.push({
+      name: trimmedName,
+      profile: (profile || "").trim(),
+      resolution: trimmedResolution,
+      size: templateSizeKey(trimmedName, trimmedResolution),
+      ram: (ram || "").trim(),
+    });
+  }
+
+  return details;
+}
+
+/**
+ * Parse the pipe-delimited `<PREFIX>=<header>|<v1>|<v2>|...` lines the script
+ * emits for the -d block formats into objects.
+ *
+ * The script already did the hard part (joining em-cli's wrapped values, and
+ * dropping its unindented "Error:" lines), so this is a plain split. Missing
+ * trailing fields come back as "" rather than undefined, so callers can render
+ * them without null checks.
+ *
+ * @param {string} output - Raw script stdout
+ * @param {string} prefix - Line prefix, e.g. "VM_DETAIL"
+ * @param {string[]} fields - Property names for the values after the header
+ * @param {string} headerField - Property name for the leading header value
+ * @returns {Array<object>}
+ */
+function parsePipeRecords(output, prefix, fields, headerField = "name") {
+  if (!output) return [];
+
+  const records = [];
+  const pattern = new RegExp(`^${prefix}=(.*)$`);
+
+  for (const line of String(output).split(/\r?\n/)) {
+    const match = line.match(pattern);
+    if (!match) continue;
+
+    const parts = match[1].split("|");
+    const header = (parts[0] || "").trim();
+    if (!header) continue;
+
+    const record = { [headerField]: header };
+    fields.forEach((field, index) => {
+      record[field] = (parts[index + 1] || "").trim();
+    });
+    records.push(record);
+  }
+
+  return records;
+}
+
+/**
+ * Parse the PLATFORM_LIST=<csv> line of the list-platform action. The script
+ * has already filtered by profile (tv → tv-* images, tizen → everything else).
+ *
+ * @param {string} output - Raw script stdout
+ * @returns {string[]}
+ */
+function parsePlatformList(output) {
+  const match = String(output || "").match(/^PLATFORM_LIST=(.*)$/m);
+  if (!match) return [];
+  return match[1]
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The platform a create uses when the caller named none — the same rule the
+ * scripts' own auto-detect applies: tv → the first tv-* image, otherwise the
+ * first non-tv image. Returns null when nothing suitable is installed.
+ *
+ * @param {string[]} platforms - names from parsePlatformList()
+ * @param {string} profile - 'tizen' or 'tv'
+ * @returns {string|null}
+ */
+function pickPlatform(platforms, profile) {
+  if (!Array.isArray(platforms) || platforms.length === 0) return null;
+  const isTv = (p) => /^tv/i.test(p);
+  const pick =
+    profile === "tv"
+      ? platforms.find(isTv)
+      : platforms.find((p) => !isTv(p)) || null;
+  return pick || null;
+}
+
+/**
+ * The emulator profile a platform image belongs to, read from the image name.
+ *
+ * em-cli does not report a profile for a VM, only the platform image it was
+ * created from (`tizen-10.0-x86_64`, `tv-samsung-10.0-x86_64`). Left to guess,
+ * the agent labelled a `tizen-*` VM "Mobile" (issue #269) — but `tizen-*` is
+ * the unified Tizen profile, the one this runner calls `tizen`; only `tv-*`
+ * images are the TV profile. Older SDKs ship `mobile-*` / `wearable-*` /
+ * `iot-*` images too, so those are reported as spelled rather than forced
+ * into tizen|tv.
+ *
+ * Only these known prefixes are recognised. A platform image can also be a
+ * user-named capture (`create-image --vm-name my-vm` → whatever the user
+ * called it), and reporting its first word as a profile would be exactly
+ * the guess this field exists to replace — so anything else yields "".
+ *
+ * @param {string} platform - Platform image name
+ * @returns {string} 'tizen' | 'tv' | 'mobile' | 'wearable' | 'iot', or "" when unknown
+ */
+const KNOWN_PLATFORM_PROFILES = ["tizen", "tv", "mobile", "wearable", "iot"];
+
+function platformProfile(platform) {
+  if (typeof platform !== "string") return "";
+  const head = platform.trim().split("-")[0].toLowerCase();
+  return KNOWN_PLATFORM_PROFILES.includes(head) ? head : "";
+}
+
+/**
+ * Extract the version string from a platform image name.
+ *
+ * Platform images follow the pattern `<profile>[-<vendor>]-<version>-<arch>`
+ * (`tizen-10.0-x86_64`, `tv-samsung-9.0-x86_64`): the version is the first
+ * hyphen-delimited segment made only of dot-separated digits. It is returned
+ * as spelled ("10.0", "10.0.1") — NOT parsed with parseFloat, which would turn
+ * "10.0.1" into 10 and "9.10" into 9.1 and misorder them; compare with
+ * comparePlatformVersions() instead.
+ *
+ * @param {string} platform - Platform image name (e.g. "tizen-10.0-x86_64")
+ * @returns {string} Version string, or "" when the name carries no version
+ */
+function platformVersion(platform) {
+  if (typeof platform !== "string") return "";
+  for (const part of platform.trim().split("-")) {
+    if (/^\d+(?:\.\d+)*$/.test(part)) return part;
+  }
+  return "";
+}
+
+/**
+ * Order two platform image names by version, newest first.
+ *
+ * Compares segment by segment as integers ("10.0.1" > "10.0", "9.10" > "9.9");
+ * a name without a version sorts after every versioned one, and equal versions
+ * compare as 0 so a stable sort keeps em-cli's list order between them.
+ *
+ * @param {string} a - Platform image name
+ * @param {string} b - Platform image name
+ * @returns {number} negative when a is newer than b, positive when older, 0 when equal
+ */
+function comparePlatformVersions(a, b) {
+  const va = platformVersion(a);
+  const vb = platformVersion(b);
+  if (!va && !vb) return 0;
+  if (!va) return 1;
+  if (!vb) return -1;
+  const sa = va.split(".").map(Number);
+  const sb = vb.split(".").map(Number);
+  const len = Math.max(sa.length, sb.length);
+  for (let i = 0; i < len; i++) {
+    const da = sa[i] || 0;
+    const db = sb[i] || 0;
+    if (da !== db) return db - da;
+  }
+  return 0;
+}
+
+/**
+ * Select the VM to launch when the caller named none.
+ *
+ * Filters the VM list by profile (default "tizen"), then picks the one with
+ * the highest platform version when multiple match. This prevents a TV VM
+ * from being launched when the user asked for a "Tizen emulator" (issue #270).
+ * Ties (same version, or no version at all) keep em-cli's list order, so the
+ * choice is deterministic across runs.
+ *
+ * @param {Array} vmDetails - Records from parseVmDetails()
+ * @param {string} profile - Target profile: "tizen", "tv", etc.
+ * @returns {object|null} The selected VM record, or null when none match
+ */
+function selectVmForLaunch(vmDetails, profile) {
+  if (!Array.isArray(vmDetails) || vmDetails.length === 0) return null;
+  const targetProfile = profile || "tizen";
+  const matching = vmDetails.filter((vm) => vm.profile === targetProfile);
+  if (matching.length === 0) return null;
+  if (matching.length === 1) return matching[0];
+  // Multiple VMs of the same profile: pick the one with the highest platform
+  // version (tizen-10.0 over tizen-9.0). Array.prototype.sort is stable, so
+  // equal versions stay in list order.
+  return [...matching].sort((a, b) =>
+    comparePlatformVersions(a.platform, b.platform),
+  )[0];
+}
+
+/**
+ * Parse VM_DETAIL= lines emitted by list-vm --detail, detail, create, and modify.
+ *
+ * Adds a derived `profile` (see platformProfile) so the caller reports the
+ * profile the envelope states instead of inferring one from the platform name.
+ */
+function parseVmDetails(output) {
+  return parsePipeRecords(output, "VM_DETAIL", [
+    "platform",
+    "template",
+    "resolution",
+    "ram",
+    "cpu_arch",
+    "cpu_count",
+    "type",
+    "skin_path",
+  ]).map((record) => ({
+    ...record,
+    profile: platformProfile(record.platform),
+  }));
+}
+
+/**
+ * Parse PLATFORM_DETAIL= lines emitted by list-platform --detail.
+ */
+function parsePlatformDetails(output) {
+  return parsePipeRecords(output, "PLATFORM_DETAIL", [
+    "profile",
+    "version",
+    "cpu_arch",
+    "skin_shape",
+    "image_path",
+  ]);
+}
+
+/**
+ * Parse MANAGER_DETAIL= lines emitted by the detail action with no VM name.
+ *
+ * Unlike the other blocks this is a single record, so it comes back as one flat
+ * key/value object keyed by em-cli's own labels ("Version", "Workspace path").
+ */
+function parseManagerDetails(output) {
+  if (!output) return {};
+
+  const info = {};
+  for (const line of String(output).split(/\r?\n/)) {
+    const match = line.match(/^MANAGER_DETAIL=(.*)$/);
+    if (!match) continue;
+    const separator = match[1].indexOf("|");
+    if (separator === -1) continue;
+    const key = match[1].slice(0, separator).trim();
+    if (key) info[key] = match[1].slice(separator + 1).trim();
+  }
+  return info;
+}
+
+/**
+ * Derive the size key a user would ask for from a template.
+ *
+ * The name's own number is authoritative: "HD3840 TV" is 3840x1080, so keying
+ * off the resolution height would make it collide with "HD1080 TV".
+ * Falls back to the resolution height for templates named without a number.
+ */
+function templateSizeKey(name, resolution) {
+  const fromName = name.match(/(\d{3,5})/);
+  if (fromName) return fromName[1];
+
+  const fromResolution = resolution.match(/^(\d{3,5})\s*[xX]\s*(\d{3,5})$/);
+  return fromResolution ? fromResolution[2] : "";
+}
+
+/**
+ * Normalize a user-supplied size into a comparable key.
+ *
+ * Accepts "1080", "1080p", "HD1080", " 1080 " → "1080", and passes a full
+ * "1920x1080" resolution through as "1920x1080".
+ *
+ * @param {string|number} input
+ * @returns {string} Normalized size, or "" when the input is unusable
+ */
+function normalizeSize(input) {
+  if (input === undefined || input === null) return "";
+
+  const raw = String(input).trim().toLowerCase().replace(/\s+/g, "");
+  if (!raw) return "";
+
+  const resolution = raw.match(/^(\d{3,5})[x*](\d{3,5})$/);
+  if (resolution) return `${resolution[1]}x${resolution[2]}`;
+
+  const size = raw.match(/^(?:hd)?(\d{3,5})p?$/);
+  return size ? size[1] : "";
+}
+
+/**
+ * Pick the template that provides the requested size for a profile.
+ *
+ * @param {Array} details - Records from parseTemplateDetails()
+ * @param {string} size - Normalized size ("1080" or "1920x1080")
+ * @param {string} profile - 'tizen' or 'tv'
+ * @returns {object|null} The matching template record, or null
+ */
+function matchTemplateForSize(details, size, profile) {
+  if (!size || !Array.isArray(details) || details.length === 0) return null;
+
+  // em-cli's own profile field is authoritative; tolerate templates that
+  // report no profile rather than dropping them.
+  const candidates = details.filter((t) => !t.profile || t.profile === profile);
+  const pool = candidates.length > 0 ? candidates : details;
+
+  const isResolution = size.includes("x");
+  const matches = pool.filter((t) =>
+    isResolution ? t.resolution.toLowerCase() === size : t.size === size,
+  );
+  if (matches.length === 0) return null;
+
+  // Prefer the plain name over a platform-qualified duplicate such as
+  // "HD1080 TV (tv-samsung-10.0-x86_64)" — em-cli accepts either, but the
+  // plain one is what its own docs use.
+  return matches.find((t) => !t.name.includes("(")) || matches[0];
+}
+
+/**
+ * Render the available sizes for an error message the caller can show the user.
+ */
+function describeAvailableSizes(details) {
+  return details
+    .filter((t) => t.size)
+    .map((t) => `${t.size} (${t.resolution}, ${t.name})`)
+    .join(", ");
+}
+
+/**
+ * Strip the platform suffix a template name copied straight out of
+ * `list-template` can carry — "HD1080 TV (tv-samsung-10.0-x86_64)". em-cli
+ * resolves the plain name, so drop the suffix instead of rejecting the
+ * round-tripped value.
+ *
+ * @param {*} template
+ * @returns {string|undefined}
+ */
+function stripTemplateSuffix(template) {
+  return template
+    ? String(template)
+        .replace(/\s*\([^)]*\)\s*$/, "")
+        .trim()
+    : undefined;
+}
+
+/** True when a flag was passed as boolean true or the string "true". */
+function isTrue(value) {
+  return value === true || value === "true";
+}
+
+/** True when an option was not given at all. */
+function isBlank(value) {
+  return value === undefined || value === null || value === "";
+}
+
+/**
+ * Screen a VM or platform name (shell safety).
+ *
+ * @param {string} command
+ * @param {string} label - "VM name" or "platform name"
+ * @param {string} [value]
+ * @returns {object|null} An error envelope, or null when the name is absent or safe
+ */
+function invalidNameError(command, label, value) {
+  if (!value || NAME_PATTERN.test(value)) return null;
+  return formatError(
+    command,
+    "invalid_parameters",
+    `Invalid ${label}: ${value}. Use only letters, digits, dot, underscore, hyphen.`,
+  );
+}
+
+/**
+ * Screen a (suffix-stripped) template name. Spaces are allowed — template names
+ * can contain spaces.
+ *
+ * @param {string} command
+ * @param {string} [template]
+ * @param {string} [shown=template] - The value to quote in the message
+ * @returns {object|null}
+ */
+function invalidTemplateError(command, template, shown = template) {
+  if (!template || TEMPLATE_PATTERN.test(template)) return null;
+  return formatError(
+    command,
+    "invalid_parameters",
+    `Invalid template name: ${shown}. Use only letters, digits, dot, underscore, hyphen, space.`,
+  );
+}
+
+/**
+ * Screen the sdb-connect wait (1-540 s, Bash tool headroom).
+ *
+ * @param {string} command
+ * @param {number} timeout - Parsed value
+ * @param {*} rawValue - The value as the caller passed it, for the message
+ * @returns {object|null}
+ */
+function timeoutRangeError(command, timeout, rawValue) {
+  if (Number.isFinite(timeout) && timeout >= 1 && timeout <= 540) return null;
+  return formatError(
+    command,
+    "invalid_parameters",
+    `Invalid timeout: ${rawValue}. Must be 1-540 seconds (Bash tool max is 600s; leave headroom).`,
+  );
+}
+
+function vmNameRequiredError(command, action) {
+  return formatError(
+    command,
+    "invalid_parameters",
+    `vmName is required for action '${action}'.`,
+    action === "create"
+      ? `tizen-sdk emulator-manager --action create --vm-name <name>`
+      : `tizen-sdk emulator-manager --action list-vm`,
+  );
+}
+
+function invalidSizeError(command, size) {
+  return formatError(
+    command,
+    "invalid_parameters",
+    `Invalid size: ${size}. Use a height like 1080, 720, 3840 (or a full resolution like 1920x1080). ` +
+      `Run action 'list-template' to see the sizes this SDK supports.`,
+  );
+}
+
+function sizeUnavailableError(command, size, profile, platform, details) {
+  return formatError(
+    command,
+    "invalid_parameters",
+    `Size ${size} is not available for profile '${profile}'${platform ? ` on platform '${platform}'` : ""}. Supported sizes: ` +
+      `${describeAvailableSizes(details) || "none reported by em-cli"}.`,
+  );
+}
+
+function templateWinsWarning(template, size) {
+  return (
+    `Both a template ('${template}') and a size (${size}) were given — the template wins, ` +
+    `so the size was not used. Pass only one.`
+  );
+}
+
+/**
+ * The script's real diagnostics land in the temp file that execPluginScript
+ * attaches to error.stdout. They must reach the envelope: without them the
+ * message is only "Command failed: bash … > /tmp/tizen-plugin-*.out", which
+ * tells the caller nothing and sends it off to cat temp files or improvise raw
+ * em-cli commands.
+ */
+function scriptOutputOf(error) {
+  return `${error.stdout || ""}\n${error.stderr || ""}`;
+}
+
+/**
+ * Generic failure envelope for a script run that matched no specific diagnosis.
+ */
+function scriptFailureError(command, action, error, scriptOutput, startTime) {
+  const diagnostics = summarizeEmulatorOutput(scriptOutput).slice(0, 6);
+  return formatError(
+    command,
+    "execution_error",
+    `Emulator ${action} failed: ${error.message}.${javaJnaHint(emcliOutputOf(scriptOutput))}${emcliExitHint(scriptOutput)}` +
+      (diagnostics.length ? ` Script output: ${diagnostics.join(" | ")}` : ""),
+    null,
+    startTime,
+    rawOutputTail(scriptOutput),
+  );
+}
+
+function successEnvelope(command, startTime, data, warnings) {
+  const envelope = new Envelope(command);
+  envelope.startTime = startTime;
+  return envelope.success(data, { warnings });
+}
+
+/** Split the value of a `KEY=a,b,c` marker match into trimmed, non-empty items. */
+function markerList(match) {
+  return match
+    ? match[1]
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+}
+
+/**
+ * Create / list / delete a custom Tizen emulator VM via em-cli.
+ *
+ * @param {object} opts - Options object
+ * @param {string} [opts.action='create'] - Action: 'create' | 'list-platform' | 'list-template' | 'list-vm' | 'delete'
+ * @param {string} [opts.vmName] - Emulator VM name (required for create/delete)
+ * @param {string} [opts.platform] - Platform image name (auto-detect if omitted for create)
+ * @param {string} [opts.template] - Exact template name; overrides opts.size when given
+ * @param {string} [opts.size] - Screen size to create at: '1080', '720', '3840', or '1920x1080'.
+ *   Required for the create action (unless opts.template or opts.assumeDefaults is set) — the size is
+ *   a user choice, so omitting it returns a 'user_input_required' failure instead of silently using 1080.
+ * @param {boolean} [opts.assumeDefaults=false] - Opt in to the default size ('1080') without being asked.
+ *   For non-interactive callers only; an interactive caller should ask the user instead.
+ * @param {string} [opts.profile='tizen'] - Profile: 'tizen' or 'tv'
+ * @param {boolean} [opts.launch=false] - Launch the VM after creating (create action only)
+ * @returns {object} Standard JSON Envelope
+ */
+async function createEmulator(
+  opts = {},
+  command = "tizen-sdk create-emulator",
+) {
+  const state = parseCreateOptions(opts);
+  const startTime = Date.now();
+
+  try {
+    const validationError = validateCreateOptions(state, opts, command);
+    if (validationError) return validationError;
+
+    // Validate the requested size before doing any work
+    const sizeGiven = !isBlank(opts.size);
+    state.requestedSize = sizeGiven ? normalizeSize(opts.size) : undefined;
+    if (sizeGiven && !state.requestedSize) {
+      return invalidSizeError(command, opts.size);
+    }
+
+    const resolved = resolveScript("tizen-emulator-manager");
+    if (resolved.error) {
+      return formatError(command, "io_error", resolved.error);
+    }
+
+    // Resolve the requested size to a template. em-cli create has no
+    // width/height flag — resolution is a property of the device template — so
+    // the size is applied by picking the template that carries it.
+    // An explicit template always wins; no size lookup is needed then.
+    // When a raw image path is given, the disk image comes from the raw image,
+    // so no template/size resolution is needed — em-cli create -a bypasses the
+    // template entirely.
+    state.explicitTemplate = Boolean(state.template);
+    if (state.explicitTemplate && state.requestedSize) {
+      state.sizeWarnings.push(
+        templateWinsWarning(state.template, state.requestedSize),
+      );
+    }
+    if (state.action === "create" && !state.template && !opts.rawImagePath) {
+      const sizeError = resolveSizeTemplate(
+        state,
+        resolved.scriptPath,
+        command,
+        startTime,
+      );
+      if (sizeError) return sizeError;
+    }
+
+    logCreateAction(state);
+
+    let output;
+    try {
+      // Hardware/skin options are passed through to em-cli. Their values were
+      // screened by validatePassThroughOptions() above — the script re-checks
+      // them, but that check runs too late to keep an injected value out of
+      // the shell.
+      output = runEmulatorScript(resolved.scriptPath, {
+        action: state.action,
+        profile: state.profile,
+        vmName: state.vmName,
+        platform: state.platform,
+        template: state.template,
+        launch: state.launch,
+        timeoutSec: state.launchTimeoutSec,
+        detail: opts.detail,
+        count: opts.count,
+        skin: opts.skin,
+        ramSize: opts.ramSize,
+        fileSharingPath: opts.fileSharingPath,
+        hwVirtualization: opts.hwVirtualization,
+        hwGlAcceleration: opts.hwGlAcceleration,
+        customPath: opts.customPath,
+        rawImagePath: opts.rawImagePath,
+      });
+    } catch (error) {
+      return createFailureError(state, opts, error, command, startTime);
+    }
+
+    return CREATE_RESULT_BUILDERS[state.action](
+      state,
+      opts,
+      output,
+      command,
+      startTime,
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to manage emulator: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/** Actions createEmulator() accepts. */
+const CREATE_ACTIONS = [
+  "create",
+  "list-platform",
+  "list-template",
+  "list-vm",
+  "delete",
+];
+
+/**
+ * Read createEmulator()'s options into the state its phases share. platform,
+ * template and the size fields are filled in / replaced while resolving the
+ * requested size.
+ */
+function parseCreateOptions(opts) {
+  const launch = isTrue(opts.launch);
+  return {
+    action: normalizeAction(opts.action || "create"),
+    vmName: opts.vmName,
+    // Mutable: a create without --platform resolves it below (issue #48).
+    platform: opts.platform,
+    profile: opts.profile || "tizen",
+    launch,
+    assumeDefaults: isTrue(opts.assumeDefaults),
+    // How long the create --launch path waits for the new VM to show up in
+    // `sdb devices`. The script's own default is 300 s, which a fresh Tizen 11
+    // image's first boot can exceed on a slow host; let the caller raise it the
+    // same way launch-emulator does (1-540, Bash tool headroom). Only meaningful
+    // with --launch — ignored otherwise.
+    launchTimeoutSec:
+      launch && opts.timeoutSec !== undefined && opts.timeoutSec !== null
+        ? parseInt(opts.timeoutSec, 10)
+        : undefined,
+    template: stripTemplateSuffix(opts.template),
+    requestedSize: undefined,
+    explicitTemplate: false,
+    matchedTemplate: null,
+    sizeWarnings: [],
+  };
+}
+
+/**
+ * Validate action, profile, --launch wait, names and pass-through options.
+ *
+ * @returns {object|null} An error envelope, or null when everything is valid
+ */
+function validateCreateOptions(state, opts, command) {
+  const { action, profile, vmName, launchTimeoutSec } = state;
+
+  if (!CREATE_ACTIONS.includes(action)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid action: ${action}. Must be one of: ${CREATE_ACTIONS.join(", ")}.`,
+    );
+  }
+
+  if (profile !== "tizen" && profile !== "tv") {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid profile: ${profile}. Must be 'tizen' or 'tv'.`,
+    );
+  }
+
+  // Validate the --launch wait (same bounds as launch-emulator)
+  if (launchTimeoutSec !== undefined) {
+    const timeoutError = timeoutRangeError(
+      command,
+      launchTimeoutSec,
+      opts.timeoutSec,
+    );
+    if (timeoutError) return timeoutError;
+  }
+
+  if ((action === "create" || action === "delete") && !vmName) {
+    return vmNameRequiredError(command, action);
+  }
+
+  return (
+    invalidNameError(command, "VM name", vmName) ||
+    invalidNameError(command, "platform name", state.platform) ||
+    invalidTemplateError(command, state.template) ||
+    validatePassThroughOptions(opts, command)
+  );
+}
+
+/**
+ * No --platform: resolve it from em-cli's own platform list, instead of leaving
+ * it to the script's auto-detect. Templates are looked up per platform
+ * (bug-044: profile-based "HD1080 Tizen" does not exist on "mobile-7.0-x86"),
+ * so with no platform the size→template step used to be skipped and
+ * `create --size 1080` silently produced em-cli's default 720x1280 VM
+ * (issue #48). Same pick rule as the scripts: tv → first tv image; otherwise
+ * the first non-tv image. The resolved name is passed down as -P, so the
+ * script's own auto-detect (one more JVM) is skipped.
+ *
+ * Does nothing when a platform was given.
+ *
+ * @returns {object|null} An error envelope when no platform image is installed
+ */
+function resolveCreatePlatform(state, scriptPath, listing, command, startTime) {
+  const { profile, platform } = state;
+  if (!platform) {
+    try {
+      const listed = parsePlatformList(
+        runEmulatorScript(scriptPath, { action: "list-platform", profile }),
+      );
+      state.platform = pickPlatform(listed, profile);
+      if (!state.platform) {
+        return formatError(
+          command,
+          "execution_error",
+          profile === "tv"
+            ? "No TV emulator platform image is installed — cannot create a TV VM. " +
+                "Install the TV SDK extension (tizen-tv-sdk-install), then retry."
+            : "No emulator platform image is installed — cannot create a VM. " +
+                "Install one with tizen-sdk-install (e.g. the tizen-10.0-x86_64 emulator image), then retry.",
+          null,
+          startTime,
+        );
+      }
+      state.sizeWarnings.push(
+        `No platform was given; resolved to '${state.platform}' (the first ${profile} platform ` +
+          `em-cli lists) so the requested size could be applied.`,
+      );
+    } catch (error) {
+      // Listing failed (em-cli hiccup) — let the script auto-detect, at the
+      // cost of the size possibly not applying; the warning below says so.
+      listing.listErrorMessage = error.message;
+    }
+  }
+  return null;
+}
+
+function listCreateTemplates(state, scriptPath, listing) {
+  try {
+    listing.details = parseTemplateDetails(
+      runEmulatorScript(scriptPath, {
+        action: "list-template",
+        profile: state.profile,
+        platform: state.platform,
+      }),
+    );
+  } catch (error) {
+    // Listing failed (old SDK, em-cli hiccup) — fall back to today's
+    // behaviour and let em-cli pick the template itself.
+    listing.listErrorMessage = error.message;
+  }
+}
+
+/**
+ * The screen size is a USER CHOICE, so refuse to guess it. Without an explicit
+ * size, the caller must either ask the user or opt in to the default on purpose
+ * (assumeDefaults) — silently picking 1080 is how the question ends up never
+ * being asked.
+ */
+function missingSizeError(state, details, command, startTime) {
+  const { profile, platform, vmName } = state;
+  const supported = details.length > 0 ? describeAvailableSizes(details) : null;
+  return formatError(
+    command,
+    "user_input_required",
+    `No screen size was given. Ask the user which screen size to create at, then pass it as 'size'. ` +
+      (supported
+        ? `Supported sizes for profile '${profile}' on platform '${platform}': ${supported}. `
+        : supported === null && !platform
+          ? `No platform was specified, so available sizes are unknown. Pass a platform with --platform. `
+          : "") +
+      `Default (offer this one first): ${DEFAULT_SIZE}. ` +
+      `For a non-interactive run, pass size=${DEFAULT_SIZE} explicitly or assumeDefaults=true.`,
+    `tizen-sdk create-emulator --action create --vm-name ${vmName} --size ${DEFAULT_SIZE}${platform ? " --platform " + platform : ""}`,
+    startTime,
+  );
+}
+
+/**
+ * Pick the template that carries the size, or record why the size could not be
+ * applied.
+ *
+ * @returns {object|null} An error envelope when the size is not available
+ */
+function applySizeTemplate(state, listing, command) {
+  const { profile, platform, sizeWarnings } = state;
+  const size = state.requestedSize || DEFAULT_SIZE;
+  if (listing.listErrorMessage) {
+    sizeWarnings.push(
+      `Could not list ${platform ? "templates" : "platforms"} to apply size ${size} (${listing.listErrorMessage}) — em-cli will choose the screen size.`,
+    );
+  }
+
+  if (listing.details.length > 0) {
+    state.matchedTemplate = matchTemplateForSize(
+      listing.details,
+      size,
+      profile,
+    );
+    if (!state.matchedTemplate) {
+      return sizeUnavailableError(
+        command,
+        size,
+        profile,
+        platform,
+        listing.details,
+      );
+    }
+    state.template = state.matchedTemplate.name;
+  } else if (sizeWarnings.length === 0 && !platform) {
+    sizeWarnings.push(
+      `No platform specified, so available templates are unknown — em-cli will choose the screen size.`,
+    );
+  } else if (sizeWarnings.length === 0 && platform) {
+    sizeWarnings.push(
+      `em-cli reported no templates for platform '${platform}', so size ${size} could not be applied — em-cli will choose the screen size.`,
+    );
+  }
+  return null;
+}
+
+/**
+ * Resolve the requested size to a template for a create without an explicit
+ * template or raw image.
+ *
+ * @returns {object|null} An error envelope, or null to go ahead with the create
+ */
+function resolveSizeTemplate(state, scriptPath, command, startTime) {
+  const listing = { details: [], listErrorMessage: null };
+
+  const platformError = resolveCreatePlatform(
+    state,
+    scriptPath,
+    listing,
+    command,
+    startTime,
+  );
+  if (platformError) return platformError;
+
+  if (state.platform) listCreateTemplates(state, scriptPath, listing);
+
+  if (!state.requestedSize && !state.assumeDefaults) {
+    return missingSizeError(state, listing.details, command, startTime);
+  }
+
+  return applySizeTemplate(state, listing, command);
+}
+
+function logCreateAction(state) {
+  const { action, profile, vmName, platform, template, matchedTemplate } =
+    state;
+  console.error(
+    `[tizen-emulator] Action: ${action}, profile: ${profile}` +
+      (vmName ? `, vm: ${vmName}` : "") +
+      (platform ? `, platform: ${platform}` : "") +
+      (template ? `, template: ${template}` : "") +
+      (matchedTemplate
+        ? ` (size ${matchedTemplate.size}, ${matchedTemplate.resolution})`
+        : "") +
+      (state.launch ? `, launch: yes` : ""),
+  );
+}
+
+/**
+ * em-cli crashed with NoSuchFieldError/NoSuchMethodError (emulator-manager core
+ * vs platform emulator plugin version mismatch), or the pre-create probe gate
+ * refused to start (EMCLI_MISMATCH=1). Same fix either way: update the SDK
+ * packages, then retry — so return a dedicated category with an executable
+ * suggested_fix instead of a bare execution_error.
+ */
+function createVersionMismatchError(
+  state,
+  opts,
+  error,
+  scriptOutput,
+  gateRefused,
+  command,
+  startTime,
+) {
+  const { action, vmName, platform, profile, template, launch } = state;
+  return formatError(
+    command,
+    "package_version_mismatch",
+    `Emulator ${action} failed: ${
+      gateRefused
+        ? "the pre-create em-cli probe found an emulator-manager core vs platform emulator " +
+          "plugin version mismatch (NoSuchFieldError/NoSuchMethodError), so the create was " +
+          "refused before touching any VM (set TIZEN_EMCLI_GATE=off to bypass the gate)."
+        : `${error.message}.${javaJnaHint(emcliOutputOf(scriptOutput))}`
+    } Caution: the package update overwrites the platform's emulator-v2/bin host libraries — ` +
+      `re-apply any manual workarounds there after updating.`,
+    versionMismatchFix(action, {
+      vmName,
+      platform,
+      profile,
+      template,
+      size: opts.size,
+      launch,
+    }),
+    startTime,
+    rawOutputTail(scriptOutput),
+  );
+}
+
+/**
+ * Turn a failed create/list/delete script run into the most specific envelope.
+ */
+function createFailureError(state, opts, error, command, startTime) {
+  const scriptOutput = scriptOutputOf(error);
+
+  // The most common create failure, and the one with a clear user action.
+  const existsMatch = scriptOutput.match(/VM '(.+?)' already exists/i);
+  if (existsMatch) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `An emulator VM named '${existsMatch[1]}' already exists. ` +
+        `Use a different name, or delete that VM first.`,
+      `node emulator-manager-cli.js delete --vm-name ${existsMatch[1]}`,
+      startTime,
+    );
+  }
+
+  // create --launch: the create half succeeded but the launch half failed
+  // and ran diagnose_launch_failure(). Report it as the launch action
+  // would — host-fix guide first — instead of a bare exec error, and say
+  // clearly that the VM exists (the user should relaunch, not re-create).
+  const diag = parseLaunchDiagnostics(scriptOutput);
+  const createdMatch = scriptOutput.match(/^VM_CREATED=(.+)$/m);
+  if (diag && createdMatch) {
+    const createdVm = createdMatch[1].trim();
+    return formatError(
+      command,
+      "emulator_boot_failed",
+      `VM '${createdVm}' was created, but launching it failed. The VM exists — after fixing ` +
+        `the host (see details), relaunch it instead of re-creating: ` +
+        `node emulator-manager-cli.js launch --vm-name ${createdVm}.`,
+      launchDiagnosisSuggestedFix(diag, createdVm),
+      startTime,
+      launchDiagnosisDetails(diag, scriptOutput),
+    );
+  }
+
+  const gateRefused = /^EMCLI_MISMATCH=1$/m.test(scriptOutput);
+  if (
+    gateRefused ||
+    JAVA_VERSION_MISMATCH_PATTERN.test(emcliOutputOf(scriptOutput))
+  ) {
+    return createVersionMismatchError(
+      state,
+      opts,
+      error,
+      scriptOutput,
+      gateRefused,
+      command,
+      startTime,
+    );
+  }
+
+  return scriptFailureError(
+    command,
+    state.action,
+    error,
+    scriptOutput,
+    startTime,
+  );
+}
+
+function listPlatformResult(state, opts, output, command, startTime) {
+  const platforms = markerList(output.match(/^PLATFORM_LIST=(.+)$/m));
+  return successEnvelope(
+    command,
+    startTime,
+    {
+      platforms,
+      // Only populated when the caller asked for --detail; an empty array
+      // means "not requested", not "none exist".
+      platform_details: parsePlatformDetails(output),
+      count: platforms.length,
+      profile: state.profile,
+    },
+    summarizeEmulatorOutput(output),
+  );
+}
+
+function listTemplateResult(state, opts, output, command, startTime) {
+  const templates = markerList(output.match(/^TEMPLATE_LIST=(.+)$/m));
+  // template_details carries the resolution of each template, which is what
+  // lets the caller offer real screen sizes instead of opaque names.
+  const templateDetails = parseTemplateDetails(output);
+  return successEnvelope(
+    command,
+    startTime,
+    {
+      templates,
+      template_details: templateDetails,
+      available_sizes: [
+        ...new Set(templateDetails.map((t) => t.size).filter(Boolean)),
+      ],
+      default_size: DEFAULT_SIZE,
+      count: templates.length,
+      profile: state.profile,
+    },
+    summarizeEmulatorOutput(output),
+  );
+}
+
+function listVmResult(state, opts, output, command, startTime) {
+  const vms = markerList(output.match(/^VM_LIST=(.+)$/m));
+  // list-vm --count short-circuits in the script: it prints VM_COUNT= only.
+  const countMatch = output.match(/^VM_COUNT=(\d+)$/m);
+  const reportedCount = countMatch ? Number(countMatch[1]) : vms.length;
+  return successEnvelope(
+    command,
+    startTime,
+    {
+      vms,
+      // Only populated when the caller asked for --detail. This is where the
+      // resolution and RAM of each existing VM come from.
+      vm_details: parseVmDetails(output),
+      count: reportedCount,
+    },
+    summarizeEmulatorOutput(output),
+  );
+}
+
+function deleteVmResult(state, opts, output, command, startTime) {
+  return successEnvelope(
+    command,
+    startTime,
+    { vm_name: state.vmName, action: "delete", status: "deleted" },
+    summarizeEmulatorOutput(output),
+  );
+}
+
+/** Read the create result markers the script printed. */
+function parseCreateMarkers(state, output) {
+  const createdMatch = output.match(/^VM_CREATED=(.+)$/m);
+  const launchedMatch = output.match(/^VM_LAUNCHED=(.+)$/m);
+  const launchedSerial = launchedMatch ? launchedMatch[1].trim() : null;
+
+  // Check if the script reported a cleanup (partial VM deleted after failed create)
+  const cleanupMatch = output.match(/Cleaning up partial VM/i);
+
+  // create --launch where the emulator never connected: the script exits 0
+  // with a warning (the VM exists), but reporting `launched: true` with no
+  // serial made a boot timeout read as a success (issue #48).
+  const launch = state.launch;
+  const launchTimedOut = launch && !launchedSerial && !cleanupMatch;
+
+  return {
+    createdVmName: createdMatch ? createdMatch[1].trim() : state.vmName,
+    launchedSerial,
+    cleanupMatch,
+    launchTimedOut,
+    // The script dropped the template and retried (TV profile), so the VM
+    // exists but not at the requested size.
+    fallbackMatch: output.match(/^TEMPLATE_FALLBACK=(.+)$/m),
+    homescreenStatus: parseHomescreenStatus(output),
+  };
+}
+
+function pushCreateWarnings(state, output, markers) {
+  const { createdVmName, fallbackMatch } = markers;
+  const warnings = state.sizeWarnings;
+
+  if (markers.launchTimedOut) {
+    warnings.push(
+      `VM '${createdVmName}' was created, but the emulator did not connect to sdb within the ` +
+        `${state.launchTimeoutSec || 300}s launch wait — it may still be booting (a fresh image's first ` +
+        `boot can take longer; pass --timeout <seconds> up to 540 to wait longer), or the boot ` +
+        `failed. Check or relaunch with: node emulator-manager-cli.js launch --vm-name ${createdVmName}`,
+    );
+  }
+
+  if (fallbackMatch) {
+    warnings.push(
+      `Template '${fallbackMatch[1].trim()}' was rejected by em-cli, so the VM was created at em-cli's ` +
+        `default size. Apply the size later with: em-cli modify -n ${createdVmName} -t "${fallbackMatch[1].trim()}".`,
+    );
+  }
+
+  // create --launch shares the pre-launch auto-heal with the launch action.
+  const healedVm = parseHwVirtAutofix(output);
+  if (healedVm) warnings.push(hwVirtAutofixWarning(healedVm));
+
+  // ...and the post-launch home screen check, for the same reason: a freshly
+  // created VM is the most likely one to hit the WSL crash loop, and
+  // create --launch is the first command most users run.
+  const homescreenWarning = homescreenFixWarning(markers.homescreenStatus, {
+    serial: markers.launchedSerial,
+    vmName: createdVmName,
+  });
+  if (homescreenWarning) warnings.push(homescreenWarning);
+}
+
+function createStatus(markers) {
+  if (markers.cleanupMatch) return "create_failed_cleaned_up";
+  return markers.launchTimedOut ? "created_launch_timeout" : "created";
+}
+
+function createdVmData(state, opts, output, markers) {
+  const { explicitTemplate, matchedTemplate } = state;
+  const { fallbackMatch, launchedSerial, homescreenStatus } = markers;
+  return {
+    vm_name: markers.createdVmName,
+    platform: state.platform || "auto-detected",
+    // template field rules:
+    //  - If TEMPLATE_FALLBACK detected: null (template was rejected by em-cli)
+    //  - If explicit template provided: the template name
+    //  - Otherwise: null (size-based creation, no template specified)
+    template: fallbackMatch ? null : state.template || null,
+    // size field rules:
+    //  - If explicit template: null (size selection is bypassed)
+    //  - If size requested: the requested size (e.g., "1080")
+    //  - Otherwise: default size (e.g., "1080")
+    size: explicitTemplate ? null : state.requestedSize || DEFAULT_SIZE,
+    // resolution field rules:
+    //  - If TEMPLATE_FALLBACK: null (template was rejected, no size applied)
+    //  - If matchedTemplate exists: the resolution from that template (e.g., "1920x1080")
+    //  - Otherwise: null (no template matched the requested size, or explicit template used)
+    resolution:
+      fallbackMatch || !matchedTemplate ? null : matchedTemplate.resolution,
+    // size_applied field rules:
+    //  - true: only when size was requested AND matched AND no fallback AND not explicit template
+    //  - false: otherwise (explicit template, fallback, unavailable size, or no match)
+    // When size_applied is false but size is reported, the requested size is not available.
+    // When size_applied is false and size is null, either a template was explicit or fallback occurred.
+    size_applied:
+      !explicitTemplate && !fallbackMatch && Boolean(matchedTemplate),
+    // What the VM actually ended up with, read back from em-cli after the
+    // create. Unlike the fields above this is observed, not inferred, so it
+    // is the honest answer to "did my size/RAM take effect?".
+    vm_detail: parseVmDetails(output)[0] || null,
+    profile: state.profile,
+    // Observed, not requested: true only when the script reported a serial.
+    launched: Boolean(launchedSerial),
+    device_serial: launchedSerial,
+    raw_image_path: opts.rawImagePath || null,
+    status: createStatus(markers),
+    ...(homescreenStatus ? { homescreen_fix: homescreenStatus } : {}),
+  };
+}
+
+function createVmResult(state, opts, output, command, startTime) {
+  const markers = parseCreateMarkers(state, output);
+  pushCreateWarnings(state, output, markers);
+  return successEnvelope(
+    command,
+    startTime,
+    createdVmData(state, opts, output, markers),
+    [...state.sizeWarnings, ...summarizeEmulatorOutput(output)],
+  );
+}
+
+/** Envelope builder for each createEmulator() action's successful script run. */
+const CREATE_RESULT_BUILDERS = {
+  "list-platform": listPlatformResult,
+  "list-template": listTemplateResult,
+  "list-vm": listVmResult,
+  delete: deleteVmResult,
+  create: createVmResult,
+};
+
+function noVmsError(command, startTime) {
+  return formatError(
+    command,
+    "emulator_not_found",
+    "No emulator VMs exist yet — create one before launching.",
+    `node emulator-manager-cli.js create --vm-name my-vm --size 1080`,
+    startTime,
+  );
+}
+
+/**
+ * Validate the launch timeout, VM name, profile and pass-through options.
+ *
+ * @returns {object|null} An error envelope, or null when everything is valid
+ */
+function validateLaunchOptions(opts, { vmName, timeout, timeoutSec }, command) {
+  const timeoutError = timeoutRangeError(command, timeout, timeoutSec);
+  if (timeoutError) return timeoutError;
+
+  // Validate vmName characters if provided (shell safety)
+  const nameError = invalidNameError(command, "VM name", vmName);
+  if (nameError) return nameError;
+
+  // The profile only drives the JS-side auto-selection below, so it is
+  // validated here against the profiles parseVmDetails() can report — the
+  // script's own -p switch accepts tizen|tv only and is never given this value.
+  const profile = opts.profile || "tizen";
+  if (!vmName && !KNOWN_PLATFORM_PROFILES.includes(profile)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid profile: ${opts.profile}. Must be one of: ${KNOWN_PLATFORM_PROFILES.join(", ")}.`,
+    );
+  }
+
+  // emulatorPath is a path option and reaches the script inside double quotes.
+  return validatePassThroughOptions(opts, command);
+}
+
+/**
+ * Pick the VM to launch from a `list-vm --detail` run.
+ *
+ * @returns {{vmName?: string, error?: object}}
+ */
+function selectLaunchVm(listOutput, profile, command, startTime) {
+  // VM_LIST= is the authoritative "do VMs exist" answer: the script prints
+  // it from `em-cli list-vm`, while the VM_DETAIL records come from a second
+  // `list-vm -d` whose failure is swallowed. Names without records must not
+  // read as "no VMs exist".
+  const vmNames = markerList(listOutput.match(/^VM_LIST=(.*)$/m));
+  const vmDetails = parseVmDetails(listOutput);
+
+  if (vmNames.length === 0 && vmDetails.length === 0) {
+    return { error: noVmsError(command, startTime) };
+  }
+  if (vmDetails.length === 0) {
+    return {
+      error: formatError(
+        command,
+        "execution_error",
+        `em-cli listed ${vmNames.length} VM(s) (${vmNames.join(", ")}) but returned no platform details, ` +
+          `so the '${profile}' profile VM cannot be identified. Pass --vm-name <name> to launch one of them.`,
+        `node emulator-manager-cli.js launch --vm-name ${vmNames[0]}`,
+        startTime,
+        rawOutputTail(listOutput),
+      ),
+    };
+  }
+
+  const selected = selectVmForLaunch(vmDetails, profile);
+  if (!selected) {
+    const uniqueProfiles = [
+      ...new Set(vmDetails.map((vm) => vm.profile).filter(Boolean)),
+    ];
+    return {
+      error: formatError(
+        command,
+        "emulator_not_found",
+        `No '${profile}' profile emulator VM found. ` +
+          `Available VM profiles: ${uniqueProfiles.join(", ") || "none"}. ` +
+          `Pass --vm-name <name> to launch a specific VM, or --profile <profile> to target a different profile.`,
+        `node emulator-manager-cli.js list-vm --detail`,
+        startTime,
+      ),
+    };
+  }
+
+  const sameProfileCount = vmDetails.filter(
+    (vm) => vm.profile === profile,
+  ).length;
+  console.error(
+    `[tizen-emulator] Selected '${selected.name}' (${selected.platform})` +
+      `${sameProfileCount > 1 ? ` — highest version among ${sameProfileCount} '${profile}' profile VMs` : ""}`,
+  );
+  return { vmName: selected.name };
+}
+
+/**
+ * When no VM name is given, select one from the existing VM list by profile
+ * (default "tizen") so that "launch the Tizen emulator" does not accidentally
+ * start a TV VM (issue #270). Among VMs of the same profile, the one with the
+ * highest platform version is preferred.
+ *
+ * @returns {{vmName?: string, error?: object}}
+ */
+function autoSelectLaunchVm(scriptPath, profile, command, startTime) {
+  console.error(
+    `[tizen-emulator] No VM name given — listing VMs to select a '${profile}' profile VM...`,
+  );
+  let listOutput;
+  try {
+    // The script's -p is a tizen|tv-only switch that list-vm does not use
+    // for filtering (only -P <platform> narrows the -d records), so the
+    // script default goes through and the profile filter is applied here,
+    // on the parsed records — that is what lets --profile mobile|wearable|iot
+    // work and keeps the "available profiles" hint below complete.
+    listOutput = runEmulatorScript(scriptPath, {
+      action: "list-vm",
+      profile: "tizen",
+      detail: true,
+    });
+  } catch (error) {
+    const combined = scriptOutputOf(error);
+    return {
+      error: formatError(
+        command,
+        "execution_error",
+        `Failed to list emulator VMs for auto-selection: ${error.message}.${javaJnaHint(emcliOutputOf(combined))}${emcliExitHint(combined)} ` +
+          `Pass --vm-name <name> to launch a specific VM without the lookup.`,
+        `node emulator-manager-cli.js list-vm --detail`,
+        startTime,
+        rawOutputTail(combined),
+      ),
+    };
+  }
+  return selectLaunchVm(listOutput, profile, command, startTime);
+}
+
+/**
+ * Surface the actionable launch failures by name, otherwise the caller only
+ * sees "Command failed: bash … > /tmp/tizen-plugin-*.out".
+ */
+function launchFailureError(error, vmName, timeout, command, startTime) {
+  const combined = scriptOutputOf(error);
+
+  const notFound = combined.match(/VM '(.+?)' not found/i);
+  if (notFound) {
+    return formatError(
+      command,
+      "emulator_not_found",
+      `No emulator VM named '${notFound[1]}' exists. Create it first, or launch a different one.`,
+      `node emulator-manager-cli.js list-vm`,
+      startTime,
+    );
+  }
+  if (/No emulator VMs found/i.test(combined)) {
+    return noVmsError(command, startTime);
+  }
+
+  // The script ran diagnose_launch_failure() — turn its LAUNCH_DIAG lines
+  // into a structured boot-failure envelope instead of a bare exec error.
+  const diag = parseLaunchDiagnostics(combined);
+  if (diag) {
+    return formatError(
+      command,
+      "emulator_boot_failed",
+      diag.phase === "connect_timeout"
+        ? `Emulator launch failed: the VM started but never connected to sdb within ${timeout}s. See details for the boot diagnosis.`
+        : `Emulator launch failed: em-cli reported a launch error. See details for the boot diagnosis.`,
+      launchDiagnosisSuggestedFix(diag, vmName),
+      startTime,
+      launchDiagnosisDetails(diag, combined),
+    );
+  }
+
+  return scriptFailureError(command, "launch", error, combined, startTime);
+}
+
+/**
+ * Warnings for a successful launch, plus the home screen check status.
+ *
+ * @returns {{warnings: string[], homescreenStatus: string|null}}
+ */
+function collectLaunchWarnings(output, serial, vmName) {
+  const warnings = summarizeEmulatorOutput(output);
+
+  // Pre-launch auto-heal: the script re-enabled hwVirtualization on a VM
+  // whose profile disabled it — report what happened and that it stuck.
+  const healedVm = parseHwVirtAutofix(output);
+  if (healedVm) warnings.push(hwVirtAutofixWarning(healedVm));
+
+  // The script bounced a wedged sdb server to make the booted emulator
+  // visible — the launch succeeded, but the restart reset every other sdb
+  // connection, so the caller deserves to know it happened.
+  if (/^SDB_SERVER_RESTARTED=1$/m.test(output)) {
+    warnings.push(
+      "The sdb server was not seeing the booted emulator and was restarted " +
+        "(sdb kill-server / start-server) to pick it up. Any other sdb connections were reset.",
+    );
+  }
+
+  // Post-launch findings on a successful boot (e.g. virgl scanout failing:
+  // display black despite boot + sdb OK) — see LAUNCH_WARN in the script.
+  for (const key of parseLaunchWarnings(output)) {
+    warnings.push(launchWarningText(key));
+  }
+
+  // Post-launch home screen check (Linux host + tizen emulator only): the script
+  // detects the crash loop, masks starter to stop its retry loop and popup,
+  // reclaims the crash dumps, and starts the home screen directly — see
+  // check_and_fix_homescreen in tizen-emulator-manager.sh. Here we only
+  // report what it found and did.
+  const homescreenStatus = parseHomescreenStatus(output);
+  const homescreenWarning = homescreenFixWarning(homescreenStatus, {
+    serial,
+    vmName,
+  });
+  if (homescreenWarning) warnings.push(homescreenWarning);
+  if (
+    homescreenStatus === null &&
+    /Detected OS: linux/i.test(output) &&
+    !/skipping the home screen check/i.test(output)
+  ) {
+    // A Linux host (the script logs "Detected OS: linux" on WSL and native
+    // Linux alike) where the check neither ran nor was gated off by the
+    // script's own target/platform layers — i.e. TIZEN_HOMESCREEN_CHECK=off or
+    // an older script. Keep the preventive note for those users; a gated skip
+    // (real device, TV/wearable image) logs "skipping the home screen check"
+    // and must not get it, since the advice does not apply there.
+    warnings.push(
+      "Linux home screen note: if the home screen fails to start, apply the fix with the " +
+        "fix-homescreen action, or use the TV profile instead: " +
+        `em-cli modify -n ${vmName || "<vm>"} -P tv-<platform>-<version>-<arch>`,
+    );
+  }
+  // homescreenStatus === "ok": checked and healthy — nothing to warn about.
+
+  return { warnings, homescreenStatus };
+}
+
+function launchedResult(output, { vmName, timeout, command, startTime }) {
+  // Parse DEVICE_SERIAL=... line from script output
+  const serialMatch = output.match(/^DEVICE_SERIAL=(.+)$/m);
+  if (!serialMatch) {
+    return formatError(
+      command,
+      "emulator_not_found",
+      "Script exited successfully but printed no DEVICE_SERIAL=... line.",
+      null,
+      startTime,
+    );
+  }
+  const serial = serialMatch[1].trim();
+
+  const { warnings, homescreenStatus } = collectLaunchWarnings(
+    output,
+    serial,
+    vmName,
+  );
+
+  const data = {
+    device_serial: serial,
+    device_type: /^emulator-/i.test(serial) ? "emulator" : "usb",
+    vm_name: vmName || null,
+    status: "launched",
+    // --timeout is the sdb-connect WAIT CAP, not a lifetime: the runner
+    // returns as soon as the VM appears in `sdb devices` and never stops the
+    // emulator afterwards (issue #98). Report both so a caller can see the
+    // wait ended early rather than "nothing happened after N seconds".
+    timeout_sec: timeout,
+    waited_ms: Date.now() - startTime,
+    emulator_keeps_running: true,
+  };
+  if (homescreenStatus) data.homescreen_fix = homescreenStatus;
+
+  return successEnvelope(command, startTime, data, warnings);
+}
+
+/**
+ * Launch an existing Tizen emulator VM via em-cli.
+ *
+ * If no vmName is given, picks a VM from `em-cli list-vm --detail`: the
+ * highest platform version among the VMs of the requested profile
+ * (see selectVmForLaunch).
+ * After launching, waits for the emulator to connect via sdb.
+ *
+ * @param {object} opts - Options object
+ * @param {string} [opts.vmName] - Emulator VM name to launch. When omitted, the
+ *   VM is auto-selected from `list-vm --detail` by profile (see selectVmForLaunch).
+ * @param {string} [opts.profile='tizen'] - Profile the auto-selection filters by
+ *   (one of KNOWN_PLATFORM_PROFILES). Ignored when opts.vmName is given.
+ * @param {number|string} [opts.timeoutSec=300] - Emulator connection wait time (seconds, 1-540)
+ * @returns {object} Standard JSON Envelope
+ */
+async function launchEmulator(
+  opts = {},
+  command = "tizen-sdk launch-emulator",
+) {
+  let vmName = opts.vmName;
+  // Only an absent value takes the default; 0 must reach the range check.
+  const timeoutSec = isBlank(opts.timeoutSec) ? 300 : opts.timeoutSec;
+  const startTime = Date.now();
+
+  try {
+    const timeout = parseInt(timeoutSec, 10);
+    const validationError = validateLaunchOptions(
+      opts,
+      { vmName, timeout, timeoutSec },
+      command,
+    );
+    if (validationError) return validationError;
+
+    const resolved = resolveScript("tizen-emulator-manager");
+    if (resolved.error) {
+      return formatError(command, "io_error", resolved.error);
+    }
+
+    if (!vmName) {
+      const selection = autoSelectLaunchVm(
+        resolved.scriptPath,
+        opts.profile || "tizen",
+        command,
+        startTime,
+      );
+      if (selection.error) return selection.error;
+      vmName = selection.vmName;
+    }
+
+    console.error(
+      `[tizen-emulator] Launching VM: ${vmName}, wait up to ${timeout}s`,
+    );
+
+    let output;
+    try {
+      // captureViaTempFile required: long-lived processes spawned by script
+      // (emulator qemu, sdb server) inherit stdout pipe, and execSync blocks
+      // forever waiting for pipe close even after script exits.
+      output = runEmulatorScript(resolved.scriptPath, {
+        action: "launch",
+        profile: "tizen",
+        vmName,
+        timeoutSec: timeout,
+        emulatorPath: opts.emulatorPath,
+      });
+    } catch (error) {
+      return launchFailureError(error, vmName, timeout, command, startTime);
+    }
+
+    return launchedResult(output, { vmName, timeout, command, startTime });
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to launch emulator: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Every action manageEmulator() accepts — the full em-cli command surface.
+ */
+const MANAGE_ACTIONS = [
+  "create",
+  "delete",
+  "launch",
+  "list-vm",
+  "list-platform",
+  "list-template",
+  "detail",
+  "modify",
+  "reset",
+  "create-image",
+  "fix-homescreen",
+];
+
+/**
+ * Alternative spellings accepted for the list-* actions. em-cli's commands are
+ * singular (list-vm, list-platform, list-template) but the project runner's
+ * action is the plural `list-templates`, so callers guess `list-vms` here and
+ * used to get "Unknown action". Map the plural onto the em-cli spelling instead.
+ */
+const ACTION_ALIASES = Object.freeze({
+  "list-vms": "list-vm",
+  "list-platforms": "list-platform",
+  "list-templates": "list-template",
+});
+
+/**
+ * Resolve an action alias to the canonical em-cli action name. Unknown values
+ * pass through unchanged so the caller's validation still reports them.
+ *
+ * @param {string} action
+ * @returns {string}
+ */
+function normalizeAction(action) {
+  return ACTION_ALIASES[action] || action;
+}
+
+/**
+ * Apply the Linux home screen fix to an already running emulator, without a
+ * relaunch. Same work the post-launch hook does: stop starter's retry loop and
+ * its "Unable to launch" popup, reclaim the crash dumps that fill /opt, and
+ * start the home screen directly (bypassing launchpad). The script owns the
+ * gate — Linux + emulator serial + tizen platform — and simply emits no
+ * HOMESCREEN_STATUS line when the fix does not apply.
+ *
+ * @param {object} opts - `vmName` optional; defaults to the first connected device
+ * @param {string} command - envelope command label
+ */
+async function fixHomescreen(
+  opts = {},
+  command = "tizen-sdk emulator-manager fix-homescreen",
+) {
+  const vmName = opts.vmName;
+  const startTime = Date.now();
+
+  if (vmName && !NAME_PATTERN.test(vmName)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid VM name: ${vmName}. Use only letters, digits, dot, underscore, hyphen.`,
+      null,
+      startTime,
+    );
+  }
+
+  const resolved = resolveScript("tizen-emulator-manager");
+  if (resolved.error)
+    return formatError(command, "io_error", resolved.error, null, startTime);
+
+  let output;
+  try {
+    output = runEmulatorScript(resolved.scriptPath, {
+      action: "fix-homescreen",
+      profile: "tizen",
+      vmName,
+    });
+  } catch (error) {
+    const combined = `${error.stdout || ""}\n${error.stderr || ""}`;
+    if (/No connected device|is not connected/i.test(combined)) {
+      return formatError(
+        command,
+        "emulator_not_found",
+        vmName
+          ? `VM '${vmName}' is not connected. Launch it first.`
+          : "No connected device. Launch an emulator first.",
+        `node emulator-manager-cli.js launch${vmName ? ` --vm-name ${vmName}` : ""}`,
+        startTime,
+        rawOutputTail(combined),
+      );
+    }
+    return formatError(
+      command,
+      "execution_error",
+      `fix-homescreen failed: ${error.message}.`,
+      null,
+      startTime,
+      rawOutputTail(combined),
+    );
+  }
+
+  const envelope = new Envelope(command);
+  envelope.startTime = startTime;
+  const warnings = summarizeEmulatorOutput(output);
+  const status = parseHomescreenStatus(output);
+  const serial =
+    (output.match(/^DEVICE_SERIAL=(.+)$/m) || [])[1]?.trim() || null;
+
+  // Same wording as the launch path — explicit: true because the caller asked
+  // for the fix, so "nothing to do" outcomes are the answer, not noise.
+  const warning = homescreenFixWarning(status, {
+    serial,
+    vmName,
+    explicit: true,
+  });
+  if (warning) warnings.push(warning);
+
+  const data = { vm_name: vmName || null, action: "fix-homescreen" };
+  if (serial) data.device_serial = serial;
+  if (status) data.homescreen_fix = status;
+  return envelope.success(data, { warnings });
+}
+
+/**
+ * Properties `modify` can change. em-cli rejects a modify with no property, so
+ * catching it here turns a cryptic failure into a usable message.
+ */
+const MODIFY_PROPERTIES = [
+  "template",
+  "size",
+  "skin",
+  "ramSize",
+  "fileSharingPath",
+  "hwVirtualization",
+  "hwGlAcceleration",
+];
+
+/**
+ * Actions manageEmulator() hands to an entry point that already implements
+ * them end to end, warnings and all.
+ */
+const MANAGE_DELEGATES = {
+  launch: (opts, command) => launchEmulator(opts, command),
+  "fix-homescreen": (opts, command) => fixHomescreen(opts, command),
+};
+
+/** Actions implemented by manageEmulator() itself (see runVmCommand). */
+const VM_COMMAND_ACTIONS = ["detail", "modify", "reset", "create-image"];
+
+/**
+ * Validate the VM / platform names, the VM requirement, the reset confirmation
+ * and the modify property list.
+ *
+ * @returns {object|null} An error envelope, or null when everything is valid
+ */
+function validateVmCommand(ctx) {
+  const { action, opts, command, vmName } = ctx;
+
+  // platform reaches the script as -P "<value>" on both the main call and the
+  // list-template lookup below, so it needs the same screen createEmulator()
+  // gives it.
+  const nameError =
+    invalidNameError(command, "VM name", vmName) ||
+    invalidNameError(command, "platform name", opts.platform);
+  if (nameError) return nameError;
+
+  // detail is the one action that is meaningful without a VM: it then reports
+  // the emulator manager's own version and workspace path.
+  if (action !== "detail" && !vmName) {
+    return vmNameRequiredError(command, action);
+  }
+
+  // reset formats the disk image and deletes every app installed on the VM.
+  // That is a user's call to make, so refuse to infer it — same reasoning as
+  // the screen-size gate in createEmulator().
+  if (action === "reset" && opts.confirm !== true && opts.confirm !== "true") {
+    return formatError(
+      command,
+      "user_input_required",
+      `Resetting VM '${vmName}' formats its disk image and deletes every app installed on it. ` +
+        `This cannot be undone. Ask the user to confirm, then pass confirm=true.`,
+      `tizen-sdk emulator-manager --action reset --vm-name ${vmName} --confirm true`,
+      ctx.startTime,
+    );
+  }
+
+  if (action === "modify" && !MODIFY_PROPERTIES.some((key) => opts[key])) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `modify needs at least one property to change. Pass one or more of: ${MODIFY_PROPERTIES.join(", ")}.`,
+    );
+  }
+
+  return null;
+}
+
+/**
+ * modify accepts a size for the same reason create does: resolution lives on
+ * the template, so changing the size means swapping the template.
+ *
+ * @returns {object|null} An error envelope, or null with ctx.template resolved
+ */
+function resolveModifySize(ctx, scriptPath) {
+  const { opts, command, profile } = ctx;
+
+  if (ctx.template) {
+    ctx.warnings.push(templateWinsWarning(ctx.template, opts.size));
+    return null;
+  }
+
+  const requestedSize = normalizeSize(opts.size);
+  if (!requestedSize) return invalidSizeError(command, opts.size);
+
+  // Without --platform, em-cli lists templates by profile, not for the VM
+  // being modified. Use the VM's own platform, as create does (issue #48).
+  let platform = opts.platform;
+  if (!platform) {
+    platform = lookupVmPlatform(scriptPath, ctx.vmName);
+    if (platform) {
+      ctx.warnings.push(
+        `No platform was given; resolved size ${requestedSize} against the platform of VM '${ctx.vmName}' ('${platform}').`,
+      );
+    }
+  }
+
+  let details;
+  try {
+    details = parseTemplateDetails(
+      runEmulatorScript(scriptPath, {
+        action: "list-template",
+        profile,
+        platform,
+      }),
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "execution_error",
+      `Could not list templates to resolve size ${requestedSize}: ${error.message}. ` +
+        `Pass an exact template name instead.`,
+      null,
+      ctx.startTime,
+    );
+  }
+
+  const matched = matchTemplateForSize(details, requestedSize, profile);
+  if (!matched) {
+    return sizeUnavailableError(
+      command,
+      requestedSize,
+      profile,
+      platform,
+      details,
+    );
+  }
+  ctx.template = matched.name;
+  return null;
+}
+
+/**
+ * The platform of an existing VM, from `list-vm --detail`.
+ *
+ * @returns {string|undefined} undefined when the lookup fails or the VM is not
+ *   listed — the caller then keeps its previous behaviour
+ */
+function lookupVmPlatform(scriptPath, vmName) {
+  try {
+    const vm = parseVmDetails(
+      runEmulatorScript(scriptPath, {
+        action: "list-vm",
+        profile: "tizen",
+        detail: true,
+      }),
+    ).find((record) => record.name === vmName);
+    return (vm && vm.platform) || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function vmCommandFailureError(ctx, error) {
+  const { action, opts, command, startTime } = ctx;
+  const scriptOutput = scriptOutputOf(error);
+
+  const notFound = scriptOutput.match(/VM '(.+?)' not found/i);
+  if (notFound) {
+    return formatError(
+      command,
+      "emulator_not_found",
+      `No emulator VM named '${notFound[1]}' exists.`,
+      `node emulator-manager-cli.js list-vm`,
+      startTime,
+    );
+  }
+
+  // em-cli refuses to write an image into a directory it did not find.
+  if (/This directory does not exist/i.test(scriptOutput)) {
+    return formatError(
+      command,
+      "io_error",
+      `The output directory '${opts.outputDir}' does not exist. em-cli will not create it — ` +
+        `make the directory first, then retry.`,
+      null,
+      startTime,
+    );
+  }
+
+  return scriptFailureError(command, action, error, scriptOutput, startTime);
+}
+
+function vmCommandWarnings(ctx, output) {
+  return [...ctx.warnings, ...summarizeEmulatorOutput(output)];
+}
+
+function detailResult(ctx, output) {
+  const { command, startTime, vmName } = ctx;
+  if (!vmName) {
+    return successEnvelope(
+      command,
+      startTime,
+      { target: "emulator-manager", manager: parseManagerDetails(output) },
+      vmCommandWarnings(ctx, output),
+    );
+  }
+  const vmDetail = parseVmDetails(output)[0] || null;
+  if (!vmDetail) {
+    return formatError(
+      command,
+      "emulator_not_found",
+      `em-cli returned no detail block for VM '${vmName}'.`,
+      `node emulator-manager-cli.js list-vm`,
+      startTime,
+    );
+  }
+  return successEnvelope(
+    command,
+    startTime,
+    { target: "vm", vm_name: vmName, vm_detail: vmDetail },
+    vmCommandWarnings(ctx, output),
+  );
+}
+
+function modifyResult(ctx, output) {
+  return successEnvelope(
+    ctx.command,
+    ctx.startTime,
+    {
+      vm_name: ctx.vmName,
+      action: "modify",
+      template: ctx.template || null,
+      // Read back from em-cli after the change, so this reflects what
+      // actually took rather than what was asked for.
+      vm_detail: parseVmDetails(output)[0] || null,
+      status: "modified",
+    },
+    vmCommandWarnings(ctx, output),
+  );
+}
+
+function resetResult(ctx, output) {
+  return successEnvelope(
+    ctx.command,
+    ctx.startTime,
+    { vm_name: ctx.vmName, action: "reset", status: "reset" },
+    vmCommandWarnings(ctx, output),
+  );
+}
+
+function createImageResult(ctx, output) {
+  const imageMatch = output.match(/^IMAGE_CREATED=(.+)$/m);
+  return successEnvelope(
+    ctx.command,
+    ctx.startTime,
+    {
+      vm_name: ctx.vmName,
+      action: "create-image",
+      image_path: imageMatch ? imageMatch[1].trim() : null,
+      compressed: isTrue(ctx.opts.compress),
+      status: "image_created",
+    },
+    vmCommandWarnings(ctx, output),
+  );
+}
+
+/** Envelope builder for each VM_COMMAND_ACTIONS action's successful script run. */
+const VM_COMMAND_RESULTS = {
+  detail: detailResult,
+  modify: modifyResult,
+  reset: resetResult,
+  "create-image": createImageResult,
+};
+
+/**
+ * Run detail / modify / reset / create-image — the actions manageEmulator()
+ * implements itself.
+ */
+function runVmCommand(action, opts, command) {
+  const ctx = {
+    action,
+    opts,
+    command,
+    vmName: opts.vmName,
+    profile: opts.profile || "tizen",
+    startTime: Date.now(),
+    template: undefined,
+    warnings: [],
+  };
+  const { vmName, profile, startTime } = ctx;
+
+  try {
+    const validationError = validateVmCommand(ctx);
+    if (validationError) return validationError;
+
+    ctx.template = stripTemplateSuffix(opts.template);
+
+    // Same screen createEmulator() applies. modify accepts a template too, and it
+    // is rendered into the script command line the same way, so it needs the same
+    // check — not just the suffix strip above. Both screens run before
+    // resolveScript() so a bad option is reported as such even when the plugin
+    // cache is missing.
+    const optionError =
+      invalidTemplateError(command, ctx.template, opts.template) ||
+      validatePassThroughOptions(opts, command);
+    if (optionError) return optionError;
+
+    const resolved = resolveScript("tizen-emulator-manager");
+    if (resolved.error) {
+      return formatError(command, "io_error", resolved.error);
+    }
+
+    if (action === "modify" && opts.size) {
+      const sizeError = resolveModifySize(ctx, resolved.scriptPath);
+      if (sizeError) return sizeError;
+    }
+
+    console.error(
+      `[tizen-emulator] Action: ${action}` +
+        (vmName ? `, vm: ${vmName}` : " (emulator manager)") +
+        (ctx.template ? `, template: ${ctx.template}` : ""),
+    );
+
+    let output;
+    try {
+      output = runEmulatorScript(resolved.scriptPath, {
+        action,
+        profile,
+        vmName,
+        template: ctx.template,
+        platform: opts.platform,
+        skin: opts.skin,
+        ramSize: opts.ramSize,
+        fileSharingPath: opts.fileSharingPath,
+        hwVirtualization: opts.hwVirtualization,
+        hwGlAcceleration: opts.hwGlAcceleration,
+        outputDir: opts.outputDir,
+        compress: isTrue(opts.compress),
+      });
+    } catch (error) {
+      return vmCommandFailureError(ctx, error);
+    }
+
+    return VM_COMMAND_RESULTS[action](ctx, output);
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to manage emulator: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Manage a Tizen emulator VM across the full em-cli surface.
+ *
+ * create / delete / list-* delegate to createEmulator() and launch delegates to
+ * launchEmulator(); those paths are long-standing and unchanged. The remaining
+ * actions — detail, modify, reset, create-image — are implemented here.
+ *
+ * @param {object} opts
+ * @param {string} [opts.action='create'] - One of MANAGE_ACTIONS
+ * @param {string} [opts.vmName] - VM name (required for every action except detail and the list-*)
+ * @param {string} [opts.platform] - Platform image name
+ * @param {string} [opts.template] - Exact template name; overrides opts.size
+ * @param {string} [opts.size] - Screen size ('1080', '720', '1920x1080') for create/modify
+ * @param {string} [opts.profile='tizen'] - 'tizen' or 'tv'
+ * @param {string} [opts.skin] - Skin style number: '1' or '2'
+ * @param {string} [opts.ramSize] - RAM in MiB: '512', '768', or '1024'
+ * @param {string} [opts.fileSharingPath] - Host directory shared with the VM
+ * @param {string} [opts.hwVirtualization] - 'yes' or 'no'
+ * @param {string} [opts.hwGlAcceleration] - 'yes' or 'no'
+ * @param {string} [opts.customPath] - Custom base disk image path (create)
+ * @param {string} [opts.rawImagePath] - Raw disk image directory (create)
+ * @param {string} [opts.outputDir] - Output directory (create-image); must already exist
+ * @param {boolean} [opts.compress=false] - Compress the created image (create-image)
+ * @param {boolean} [opts.confirm=false] - Required for reset, which is destructive
+ * @param {boolean} [opts.detail=false] - Detail mode for the list-* actions
+ * @param {boolean} [opts.count=false] - Count-only mode for list-vm
+ * @returns {object} Standard JSON Envelope
+ */
+async function manageEmulator(
+  opts = {},
+  command = "tizen-sdk emulator-manager",
+) {
+  const action = normalizeAction(opts.action || "create");
+
+  if (!MANAGE_ACTIONS.includes(action)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid action: ${action}. Must be one of: ${MANAGE_ACTIONS.join(", ")}.`,
+    );
+  }
+
+  const delegate = MANAGE_DELEGATES[action];
+  if (delegate) return delegate(opts, command);
+  if (!VM_COMMAND_ACTIONS.includes(action)) {
+    return createEmulator({ ...opts, action }, command);
+  }
+  return runVmCommand(action, opts, command);
+}
+
+module.exports = {
+  manageEmulator,
+  createEmulator,
+  launchEmulator,
+  DEFAULT_SIZE,
+  MANAGE_ACTIONS,
+  ACTION_ALIASES,
+  normalizeAction,
+  // Exported for tests — size resolution and output parsing are pure and worth
+  // covering without em-cli.
+  parseTemplateDetails,
+  parseVmDetails,
+  platformProfile,
+  platformVersion,
+  comparePlatformVersions,
+  selectVmForLaunch,
+  parsePlatformDetails,
+  parseManagerDetails,
+  parseLaunchDiagnostics,
+  parseHomescreenStatus,
+  homescreenFixWarning,
+  fixHomescreen,
+  parseHwVirtAutofix,
+  hwVirtAutofixWarning,
+  parseLaunchWarnings,
+  launchWarningText,
+  launchDiagnosisDetails,
+  launchDiagnosisSuggestedFix,
+  summarizeEmulatorOutput,
+  rawOutputTail,
+  javaJnaHint,
+  emcliOutputOf,
+  emcliExitHint,
+  READ_ONLY_EMCLI_ACTIONS,
+  versionMismatchFix,
+  JAVA_JNA_PATTERN,
+  JAVA_VERSION_MISMATCH_PATTERN,
+  buildEmulatorArgs,
+  normalizeSize,
+  matchTemplateForSize,
+  parsePlatformList,
+  pickPlatform,
+};

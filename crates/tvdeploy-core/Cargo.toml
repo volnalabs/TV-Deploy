@@ -4,6 +4,7 @@ description = "TV Deploy core: safe WGT analysis, validated Samsung CLI invocati
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

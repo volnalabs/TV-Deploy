@@ -28,6 +28,7 @@ function Shell({ settings, refresh }: { settings: Settings; refresh: () => void 
   const [tool, setTool] = useState<ToolchainStatus | null>(null);
   const [tv, setTv] = useState<TvInfo | null>(null);
   const [report, setReport] = useState<PackageReport | null>(null);
+  const [packagePath, setPackagePath] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const theme = useResolvedTheme(settings.theme);
 
@@ -36,7 +37,7 @@ function Shell({ settings, refresh }: { settings: Settings; refresh: () => void 
   useEffect(() => { document.documentElement.dataset.theme = theme; }, [theme]);
 
   const toggleTheme = () => api.savePreferences({ theme: theme === "dark" ? "light" : "dark", language: settings.language, default_port: settings.default_port, timeout_ms: settings.timeout_ms }).then(refresh);
-  const ready = !!tool && tool.sdk_ready && tool.cli_ready && tool.node !== "missing";
+  const ready = !!tool && tool.sdk_ready && tool.tv_extension_ready && tool.cli_ready && tool.node !== "missing";
 
   return (
     <div className="flex h-full flex-col">
@@ -60,10 +61,11 @@ function Shell({ settings, refresh }: { settings: Settings; refresh: () => void 
             {tool && !ready ? <SetupPanel status={tool} onReady={() => { loadTool(); refresh(); }} /> : <TvPanel saved={settings.devices} tv={tv} onTv={setTv} onSavedChanged={refresh} />}
           </Step>
           <Step n={2} title={t("step2")} done={!!report}>
-            <PackagePanel report={report} onReport={setReport} />
+            <PackagePanel report={report} onReport={(r, path) => { setReport(r); setPackagePath(path); }} />
           </Step>
           <Step n={3} title={t("step3")}>
-            <InstallPanel tv={tv} report={report} />
+            <InstallPanel tv={tv} report={report} packagePath={packagePath}
+              profiles={settings.certificate_profiles} onProfilesChanged={refresh} />
           </Step>
         </div>
       </main>

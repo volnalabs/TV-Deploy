@@ -1,20 +1,29 @@
-# Test report — iteration 1
+# Test report — Public Preview 0.1.0
 
-Environment: Ubuntu 24.04 sandbox, Rust 1.91.1, Node 22.23.4. **No display, no Samsung TV, no Windows/macOS.**
+## Automated tests present in the repository
 
-## Executed and passing
-| Suite | Result | What it covers |
-|---|---|---|
-| `cargo test --workspace` | 38 passed (36 core + 2 settings) | IP/port/subnet/serial/path validation incl. injection attempts; WGT analysis (metadata, signature states, zip-slip names, DTD/entity bomb, oversized XML, non-zip, empty, wrong extension, original file untouched); envelope parsing against **real captured output** of the Samsung scripts (incl. noise on stdout and the legacy `error` shape); diagnosis mapping; redaction; TCP probe (open/refused on loopback); process runner (capture, timeout, cancel, crash without envelope, missing script/node); settings round-trip + no secret-like fields |
-| e2e `init_connect_duid_through_real_scripts` | passed | **Real vendored Samsung scripts** (`sdk-init`, `remote-device connect`, `cert-manager acquire-duid`) driven by our runner against a **mock `sdb` shell script**. Confirms private-HOME mechanism, argv construction, JSON shapes. Does **not** test a TV |
-| `npm test` (vitest) | 6 passed | ru/en key parity and placeholder parity, language resolution, formatting, IPv4 shape |
-| `tsc --noEmit`, `vite build`, `cargo check` (Tauri crate), `cargo clippy -D warnings` (core), `cargo fmt` | clean | static checks |
+The project includes Rust unit/integration tests for input validation, WGT parsing and archive safety, Samsung CLI envelope parsing, diagnostics, redaction and process execution. It also includes a scripted end-to-end check which runs the vendored Samsung CLI scripts against a mock SDB executable, plus Vitest checks for localization and frontend utilities.
 
-A bug found by the e2e test: the app's root `package.json` (`"type": "module"`) made Node treat the vendored CommonJS
-Samsung scripts as ES modules. Fixed with `resources/samsung-cli/package.json` (`"type": "commonjs"`).
+The earlier development report recorded:
+- Rust workspace: 38 tests passed in the authoring Linux environment.
+- Frontend Vitest: 6 tests passed.
+- The mock-SDB test exercised the real vendored Samsung scripts, but **did not exercise a physical television**.
 
-## NOT executed (do not assume these work)
-* Any run on a physical Samsung TV (connect, DUID, Developer-Mode/Host-IP diagnoses) — see `ACCEPTANCE-CHECKLIST.md`.
-* Launching the app window / visual check / drag-and-drop / dark theme.
-* Windows, macOS (ARM64/Intel) builds; `tauri build` bundling; `scripts/fetch-node.mjs`; GitHub Actions workflows.
-* `cargo clippy`/`fmt` on the Tauri crate in CI form (core only was linted).
+## CI failures found during integration
+
+The latest development commit before this PR (`a492e58`) had four CI issues, now corrected in this PR:
+- Rust formatting differences in `tvdeploy-core/src/samsung/commands.rs`.
+- An unused React icon import, rejected by TypeScript's no-unused-locals check.
+- Missing `tempfile` dev-dependency for Tauri crate tests.
+- A moved-value error in the toolchain status response.
+
+The PR's live GitHub Actions checks are the authoritative validation for this patched tree. Do not treat the report as a pass until those checks complete successfully.
+
+## Not tested yet
+
+- Physical Samsung TV connection, DUID, Samsung Account OAuth, online certificate issuance, signing and installation.
+- Visual interaction in a packaged desktop window.
+- Windows/macOS/Linux installers on real operating systems.
+- macOS Intel runner packaging on the replacement GitHub Actions image.
+
+See [ACCEPTANCE-CHECKLIST.md](ACCEPTANCE-CHECKLIST.md) for the required manual verification.
