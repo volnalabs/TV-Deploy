@@ -13,6 +13,9 @@ export function SetupPanel({ status, onReady }: { status: ToolchainStatus; onRea
   const [found, setFound] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Key | null>(null);
+  const [installing, setInstalling] = useState(false);
+  const [installMessage, setInstallMessage] = useState<string | null>(null);
+  const [installError, setInstallError] = useState<string | null>(null);
 
   useEffect(() => {
     api.findExistingSdk().then(setFound).catch(() => setFound([]));
@@ -37,6 +40,23 @@ export function SetupPanel({ status, onReady }: { status: ToolchainStatus; onRea
     if (typeof p === "string") await apply(p);
   };
 
+  const install = async () => {
+    setInstalling(true);
+    setInstallError(null);
+    setInstallMessage(t("setupInstalling"));
+    try {
+      await api.installSamsungSdk();
+      setInstallMessage(null);
+      onReady();
+    } catch (e) {
+      const parsed = toApiError(e);
+      setInstallError(parsed.detail || parsed.code || t("err_internal"));
+      setInstallMessage(null);
+    } finally {
+      setInstalling(false);
+    }
+  };
+
   const brokenBuild = status.node === "missing" ? "setupNodeMissing" : !status.cli_ready ? "setupCliMissing" : null;
 
   return (
@@ -45,7 +65,7 @@ export function SetupPanel({ status, onReady }: { status: ToolchainStatus; onRea
         <Wrench size={18} className="mt-0.5 text-[var(--accent)]" aria-hidden />
         <div className="min-w-0 flex-1">
           <p className="m-0 font-semibold">{t("setupTitle")}</p>
-          <p className="m-0 mt-1 text-[var(--muted)]">{t("setupBody")}</p>
+          <p className="m-0 mt-1 text-[var(--muted)]">{t("setupAutoBody")}</p>
           {brokenBuild && <p className="m-0 mt-3 text-[var(--err)]">{t(brokenBuild)}</p>}
           {found.length > 0 && (
             <div className="mt-4">
@@ -58,9 +78,15 @@ export function SetupPanel({ status, onReady }: { status: ToolchainStatus; onRea
               ))}
             </div>
           )}
-          <div className="mt-4 flex items-center gap-3">
-            <Button busy={busy} disabled={!!brokenBuild} onClick={choose}><FolderOpen size={15} aria-hidden />{t("setupChoose")}</Button>
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <Button variant="primary" busy={installing} disabled={!!brokenBuild || busy} onClick={() => void install()}>
+              <Wrench size={15} aria-hidden />
+              {status.sdk_ready ? t("setupInstallExtension") : t("setupAutoInstall")}
+            </Button>
+            <Button busy={busy} disabled={!!brokenBuild || installing} onClick={choose}><FolderOpen size={15} aria-hidden />{t("setupChoose")}</Button>
           </div>
+          {installMessage && <p role="status" className="m-0 mt-3 text-sm text-[var(--muted)]">{installMessage}</p>}
+          {installError && <p role="alert" className="m-0 mt-3 whitespace-pre-wrap text-sm text-[var(--err)]">{installError}</p>}
           {error && <p role="alert" className="m-0 mt-3 text-[var(--err)]">{t(error)}</p>}
           <p className="m-0 mt-4 text-xs text-[var(--muted)]">{t("setupDiskNote", { gb: status.sdk_required_gb })}</p>
         </div>
