@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
 use tauri::{AppHandle, State};
-use tvdeploy_core::connectivity::{local_ip_towards, probe_tcp, Probe};
+use tvdeploy_core::connectivity::{local_ip_towards, probe_tcp, Probe, MIN_DIAGNOSTIC_TIMEOUT};
 use tvdeploy_core::diagnostics::{self, Diagnosis};
 use tvdeploy_core::package::{analyze_wgt, PackageError, PackageReport};
 use tvdeploy_core::samsung::commands::Invocation;
@@ -311,7 +311,7 @@ pub async fn connect_tv(
     let probe = probe_tcp(
         ip4,
         port,
-        Duration::from_millis(timeout_ms.clamp(500, 15_000)),
+        Duration::from_millis(timeout_ms.clamp(MIN_DIAGNOSTIC_TIMEOUT.as_millis() as u64, 15_000)),
     );
     if let Some(d) = diagnostics::from_probe(probe) {
         return Ok(ConnectOutcome {

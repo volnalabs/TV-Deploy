@@ -4,6 +4,7 @@ description = "A simple and modern application installer for Samsung Smart TVs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [lib]
 name = "tv_deploy_lib"

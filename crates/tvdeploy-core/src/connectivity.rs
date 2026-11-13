@@ -6,6 +6,9 @@ use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
+/// Smallest probe timeout that reliably distinguishes Refused from TimedOut on every OS.
+pub const MIN_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_millis(3_000);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Probe {
@@ -20,6 +23,10 @@ pub enum Probe {
     Other,
 }
 
+/// NOTE (found by CI on Windows): Windows retries SYN packets and reports a refused connection
+/// only after ~2 s. With a shorter `timeout` a closed port is therefore reported as
+/// `TimedOut`, not `Refused`. Callers that want to tell "closed port" from "no answer" must use a
+/// timeout of at least [`MIN_DIAGNOSTIC_TIMEOUT`].
 pub fn probe_tcp(ip: Ipv4Addr, port: u16, timeout: Duration) -> Probe {
     let addr = SocketAddr::from((ip, port));
     match TcpStream::connect_timeout(&addr, timeout) {
@@ -68,7 +75,7 @@ mod tests {
         );
         drop(l);
         assert_eq!(
-            probe_tcp(Ipv4Addr::LOCALHOST, port, Duration::from_secs(1)),
+            probe_tcp(Ipv4Addr::LOCALHOST, port, MIN_DIAGNOSTIC_TIMEOUT),
             Probe::Refused
         );
     }
