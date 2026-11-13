@@ -139,7 +139,7 @@ impl Invocation {
         validate_profile(profile)?;
         if duid.is_empty()
             || duid.len() > 256
-            || duid.contains(['\\n', '\\r', '\\0'])
+            || duid.chars().any(|c| c.is_control())
             || !duid.bytes().all(|b| b.is_ascii_alphanumeric() || b"#.-:_".contains(&b))
         {
             return Err(ValidationError::BadPath);
