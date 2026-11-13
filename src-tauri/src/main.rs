@@ -1,1 +1,3 @@
-fn main(){ tv_deploy_lib::run() }
+fn main() {
+    tv_deploy_lib::run()
+}

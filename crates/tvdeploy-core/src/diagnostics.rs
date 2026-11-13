@@ -50,15 +50,32 @@ pub fn from_envelope(env: &Envelope) -> Option<Diagnosis> {
     if env.is_success() {
         return None;
     }
-    let cat = env.errors.first().map(|e| e.category()).unwrap_or("unknown_error");
+    let cat = env
+        .errors
+        .first()
+        .map(|e| e.category())
+        .unwrap_or("unknown_error");
     Some(match cat {
-        "sdk_path_not_set" | "sdk_path_invalid" | "sdk_path_not_accessible" | "install_required" | "dependency_missing" => Diagnosis::ToolsMissing,
-        "node_not_found" | "node_version_unsupported" | "runner_not_found" | "runner_failed" | "script_not_found" => Diagnosis::NodeProblem,
+        "sdk_path_not_set"
+        | "sdk_path_invalid"
+        | "sdk_path_not_accessible"
+        | "install_required"
+        | "dependency_missing" => Diagnosis::ToolsMissing,
+        "node_not_found"
+        | "node_version_unsupported"
+        | "runner_not_found"
+        | "runner_failed"
+        | "script_not_found" => Diagnosis::NodeProblem,
         "insufficient_disk_space" => Diagnosis::NotEnoughDiskSpace,
         "device_not_found" | "multiple_devices" => Diagnosis::ConnectionRejected,
         "execution_error" => {
             // cert-manager legacy shape wraps the underlying message; classify by text.
-            let msg = env.errors.first().and_then(|e| e.message.as_deref()).unwrap_or("").to_ascii_lowercase();
+            let msg = env
+                .errors
+                .first()
+                .and_then(|e| e.message.as_deref())
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if msg.contains("sdb not found") || msg.contains("sdb not available") {
                 Diagnosis::ToolsMissing
             } else if msg.contains("timed out") || msg.contains("timeout") {
@@ -90,7 +107,11 @@ pub fn redact(s: &str) -> String {
     s.lines()
         .map(|l| {
             let low = l.to_ascii_lowercase();
-            if low.contains("password") || low.contains("passwd") || low.contains("token") || low.contains("secret") {
+            if low.contains("password")
+                || low.contains("passwd")
+                || low.contains("token")
+                || low.contains("secret")
+            {
                 "[redacted line]".to_string()
             } else {
                 l.to_string()
@@ -107,9 +128,13 @@ mod tests {
 
     #[test]
     fn real_failures_map_to_tools_missing() {
-        let e = parse_envelope(include_str!("../tests/fixtures/connect_failure_no_sdk.out")).unwrap();
+        let e =
+            parse_envelope(include_str!("../tests/fixtures/connect_failure_no_sdk.out")).unwrap();
         assert_eq!(from_envelope(&e), Some(Diagnosis::ToolsMissing));
-        let e = parse_envelope(include_str!("../tests/fixtures/acquire_duid_error_no_sdk.out")).unwrap();
+        let e = parse_envelope(include_str!(
+            "../tests/fixtures/acquire_duid_error_no_sdk.out"
+        ))
+        .unwrap();
         assert_eq!(from_envelope(&e), Some(Diagnosis::ToolsMissing));
     }
 
@@ -129,7 +154,8 @@ mod tests {
     #[test]
     fn redaction_and_home_stripping() {
         assert_eq!(redact("ok\nmy password is x"), "ok\n[redacted line]");
-        let e = parse_envelope(include_str!("../tests/fixtures/connect_failure_no_sdk.out")).unwrap();
+        let e =
+            parse_envelope(include_str!("../tests/fixtures/connect_failure_no_sdk.out")).unwrap();
         let d = technical_detail(&e, Some("<HOME>"));
         assert!(!d.contains("<HOME>"));
         assert!(d.contains("~/tizen-sdk"));

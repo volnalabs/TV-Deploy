@@ -37,7 +37,10 @@ pub struct EnvError {
 impl EnvError {
     /// Best available stable category.
     pub fn category(&self) -> &str {
-        self.error_category.as_deref().or(self.code.as_deref()).unwrap_or("unknown_error")
+        self.error_category
+            .as_deref()
+            .or(self.code.as_deref())
+            .unwrap_or("unknown_error")
     }
 }
 
@@ -98,7 +101,15 @@ pub fn parse_envelope(stdout: &str) -> Option<Envelope> {
     Some(Envelope {
         status,
         result: raw.result,
-        warnings: raw.warnings.into_iter().map(|w| w.as_str().map(str::to_string).unwrap_or_else(|| w.to_string())).collect(),
+        warnings: raw
+            .warnings
+            .into_iter()
+            .map(|w| {
+                w.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| w.to_string())
+            })
+            .collect(),
         errors: raw.errors,
         command: raw.command,
         duration_ms: raw.duration_ms,
@@ -120,14 +131,20 @@ mod tests {
 
     #[test]
     fn parses_real_failure() {
-        let e = parse_envelope(include_str!("../../tests/fixtures/connect_failure_no_sdk.out")).unwrap();
+        let e = parse_envelope(include_str!(
+            "../../tests/fixtures/connect_failure_no_sdk.out"
+        ))
+        .unwrap();
         assert_eq!(e.status, Status::Failure);
         assert_eq!(e.errors[0].category(), "sdk_path_not_set");
     }
 
     #[test]
     fn parses_legacy_error_shape() {
-        let e = parse_envelope(include_str!("../../tests/fixtures/acquire_duid_error_no_sdk.out")).unwrap();
+        let e = parse_envelope(include_str!(
+            "../../tests/fixtures/acquire_duid_error_no_sdk.out"
+        ))
+        .unwrap();
         assert_eq!(e.status, Status::Error);
         assert_eq!(e.errors[0].category(), "execution_error");
     }

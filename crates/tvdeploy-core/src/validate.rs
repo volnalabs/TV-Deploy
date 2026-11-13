@@ -49,7 +49,11 @@ pub fn parse_port(input: u32) -> Result<u16, ValidationError> {
 pub fn parse_subnet_prefix(input: &str) -> Result<String, ValidationError> {
     let s = input.trim();
     let parts: Vec<&str> = s.split('.').collect();
-    if parts.len() != 3 || parts.iter().any(|p| p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit())) {
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|p| p.is_empty() || p.len() > 3 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
         return Err(ValidationError::BadSubnet);
     }
     let probe = format!("{s}.1");
@@ -65,7 +69,10 @@ pub fn parse_serial(input: &str) -> Result<(Ipv4Addr, u16), ValidationError> {
     let (ip, port) = input.split_once(':').ok_or(ValidationError::BadSerial)?;
     let ip = parse_tv_ip(ip).map_err(|_| ValidationError::BadSerial)?;
     let port: u32 = port.parse().map_err(|_| ValidationError::BadSerial)?;
-    Ok((ip, parse_port(port).map_err(|_| ValidationError::BadSerial)?))
+    Ok((
+        ip,
+        parse_port(port).map_err(|_| ValidationError::BadSerial)?,
+    ))
 }
 
 pub fn clamp_timeout_ms(ms: u64) -> Result<u64, ValidationError> {
@@ -80,7 +87,13 @@ pub fn clamp_timeout_ms(ms: u64) -> Result<u64, ValidationError> {
 /// with `-` (argument injection).
 pub fn check_cli_path(path: &str) -> Result<(), ValidationError> {
     let p = std::path::Path::new(path);
-    if path.is_empty() || path.contains('\0') || path.contains('\n') || path.contains('\r') || path.starts_with('-') || !p.is_absolute() {
+    if path.is_empty()
+        || path.contains('\0')
+        || path.contains('\n')
+        || path.contains('\r')
+        || path.starts_with('-')
+        || !p.is_absolute()
+    {
         return Err(ValidationError::BadPath);
     }
     Ok(())
@@ -99,12 +112,24 @@ mod tests {
 
     #[test]
     fn accepts_normal_lan_ip() {
-        assert_eq!(parse_tv_ip(" 192.168.1.50 ").unwrap(), Ipv4Addr::new(192, 168, 1, 50));
+        assert_eq!(
+            parse_tv_ip(" 192.168.1.50 ").unwrap(),
+            Ipv4Addr::new(192, 168, 1, 50)
+        );
     }
 
     #[test]
     fn rejects_garbage_and_injection() {
-        for bad in ["", "tv.local", "192.168.1", "192.168.1.256", "1.2.3.4; rm -rf /", "-1.2.3.4", "０.0.0.1", "192.168.1.5\n--x"] {
+        for bad in [
+            "",
+            "tv.local",
+            "192.168.1",
+            "192.168.1.256",
+            "1.2.3.4; rm -rf /",
+            "-1.2.3.4",
+            "０.0.0.1",
+            "192.168.1.5\n--x",
+        ] {
             assert!(parse_tv_ip(bad).is_err(), "{bad:?} should fail");
         }
     }
@@ -126,7 +151,14 @@ mod tests {
     #[test]
     fn subnet_prefix() {
         assert_eq!(parse_subnet_prefix("192.168.1").unwrap(), "192.168.1");
-        for bad in ["192.168", "192.168.1.1", "a.b.c", "1..2", "127.0.0", "192.168.1; ls"] {
+        for bad in [
+            "192.168",
+            "192.168.1.1",
+            "a.b.c",
+            "1..2",
+            "127.0.0",
+            "192.168.1; ls",
+        ] {
             assert!(parse_subnet_prefix(bad).is_err(), "{bad}");
         }
     }

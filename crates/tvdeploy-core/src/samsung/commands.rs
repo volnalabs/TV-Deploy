@@ -44,11 +44,17 @@ impl Invocation {
     /// scripts (core/sdk.js `readSdkPath`), so this is the only supported way.
     pub fn sdk_init(sdk_path: &str) -> Result<Self, ValidationError> {
         check_cli_path(sdk_path)?;
-        Ok(Self { script: Script::SdkInit, args: vec![sdk_path.to_string()] })
+        Ok(Self {
+            script: Script::SdkInit,
+            args: vec![sdk_path.to_string()],
+        })
     }
 
     pub fn check_node() -> Self {
-        Self { script: Script::CheckNode, args: vec![] }
+        Self {
+            script: Script::CheckNode,
+            args: vec![],
+        }
     }
 
     /// LAN scan. With `subnet = None` the Samsung CLI decides which local subnet to sweep.
@@ -61,23 +67,52 @@ impl Invocation {
         args.push(port.to_string());
         args.push("--timeout".into());
         args.push(clamp_timeout_ms(timeout_ms)?.to_string());
-        Ok(Self { script: Script::RemoteDevice, args })
+        Ok(Self {
+            script: Script::RemoteDevice,
+            args,
+        })
     }
 
     pub fn connect(ip: Ipv4Addr, port: u16) -> Self {
-        Self { script: Script::RemoteDevice, args: vec!["connect".into(), ip.to_string(), "--port".into(), port.to_string()] }
+        Self {
+            script: Script::RemoteDevice,
+            args: vec![
+                "connect".into(),
+                ip.to_string(),
+                "--port".into(),
+                port.to_string(),
+            ],
+        }
     }
 
     pub fn disconnect(ip: Ipv4Addr, port: u16) -> Self {
-        Self { script: Script::RemoteDevice, args: vec!["disconnect".into(), ip.to_string(), "--port".into(), port.to_string()] }
+        Self {
+            script: Script::RemoteDevice,
+            args: vec![
+                "disconnect".into(),
+                ip.to_string(),
+                "--port".into(),
+                port.to_string(),
+            ],
+        }
     }
 
     pub fn list_connected() -> Self {
-        Self { script: Script::RemoteDevice, args: vec!["list".into()] }
+        Self {
+            script: Script::RemoteDevice,
+            args: vec!["list".into()],
+        }
     }
 
     pub fn acquire_duid(ip: Ipv4Addr, port: u16) -> Self {
-        Self { script: Script::CertManager, args: vec!["acquire-duid".into(), "--serial".into(), format!("{ip}:{port}")] }
+        Self {
+            script: Script::CertManager,
+            args: vec![
+                "acquire-duid".into(),
+                "--serial".into(),
+                format!("{ip}:{port}"),
+            ],
+        }
     }
 }
 
@@ -88,7 +123,10 @@ mod tests {
     #[test]
     fn scan_args() {
         let i = Invocation::scan(Some("192.168.1"), 26101, 3000).unwrap();
-        assert_eq!(i.args, ["scan", "192.168.1", "--port", "26101", "--timeout", "3000"]);
+        assert_eq!(
+            i.args,
+            ["scan", "192.168.1", "--port", "26101", "--timeout", "3000"]
+        );
         assert!(Invocation::scan(Some("192.168.1; ls"), 26101, 3000).is_err());
         assert!(Invocation::scan(None, 26101, 5).is_err());
     }
@@ -97,6 +135,9 @@ mod tests {
     fn connect_args_are_separate_argv_items() {
         let i = Invocation::connect("192.168.1.5".parse().unwrap(), 26101);
         assert_eq!(i.args, ["connect", "192.168.1.5", "--port", "26101"]);
-        assert_eq!(Invocation::acquire_duid("192.168.1.5".parse().unwrap(), 26101).args[2], "192.168.1.5:26101");
+        assert_eq!(
+            Invocation::acquire_duid("192.168.1.5".parse().unwrap(), 26101).args[2],
+            "192.168.1.5:26101"
+        );
     }
 }

@@ -62,13 +62,22 @@ mod tests {
     fn open_and_refused_on_loopback() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        assert_eq!(probe_tcp(Ipv4Addr::LOCALHOST, port, Duration::from_secs(1)), Probe::Open);
+        assert_eq!(
+            probe_tcp(Ipv4Addr::LOCALHOST, port, Duration::from_secs(1)),
+            Probe::Open
+        );
         drop(l);
-        assert_eq!(probe_tcp(Ipv4Addr::LOCALHOST, port, Duration::from_secs(1)), Probe::Refused);
+        assert_eq!(
+            probe_tcp(Ipv4Addr::LOCALHOST, port, Duration::from_secs(1)),
+            Probe::Refused
+        );
     }
 
     #[test]
     fn local_ip_for_loopback_is_loopback() {
-        assert_eq!(local_ip_towards(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(
+            local_ip_towards(Ipv4Addr::LOCALHOST),
+            Some(Ipv4Addr::LOCALHOST)
+        );
     }
 }

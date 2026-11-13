@@ -4,6 +4,6 @@
   "commit": "1509f7b9c5f659dda2222ce4264a3a3a35cbbe69",
   "upstream_version": "1.7.0",
   "license": "Apache-2.0",
-  "tree_sha256": "78880e81a3b751188813f1ca6b62fef05091d9765ddc585a68671748e68a4285",
-  "note": "lib/tests removed; common/tools (dlog-analyzer binaries) NOT redistributed. Update with scripts/vendor-samsung-cli.sh"
+  "tree_sha256": "81aba695d2a2db8164b441040f480f76cf542fcfcd3f2daedd484cea98ac7638",
+  "note": "lib/tests removed; common/tools (dlog-analyzer binaries) NOT redistributed; package.json (type=commonjs) is TV Deploy's own and excluded from tree_sha256. Update with scripts/vendor-samsung-cli.sh"
 }

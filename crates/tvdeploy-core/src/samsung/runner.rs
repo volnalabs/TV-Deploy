@@ -114,7 +114,9 @@ pub fn run(tc: &Toolchain, inv: &Invocation, opts: &RunOptions) -> Result<RunOut
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let mut child = cmd.spawn().map_err(|e| RunError::Spawn(e.kind().to_string()))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| RunError::Spawn(e.kind().to_string()))?;
     let out_h = drain(child.stdout.take().expect("piped"));
     let err_h = drain(child.stderr.take().expect("piped"));
 
@@ -144,7 +146,12 @@ pub fn run(tc: &Toolchain, inv: &Invocation, opts: &RunOptions) -> Result<RunOut
     let stdout = out_h.join().unwrap_or_default();
     let stderr = err_h.join().unwrap_or_default();
     let envelope = parse_envelope(&stdout);
-    Ok(RunOutput { exit_code: status.code(), stdout, stderr, envelope })
+    Ok(RunOutput {
+        exit_code: status.code(),
+        stdout,
+        stderr,
+        envelope,
+    })
 }
 
 /// Locates `sdb` inside an SDK directory (same location the Samsung CLI itself uses:
@@ -164,7 +171,9 @@ mod tests {
     // behaviour.
     fn node() -> Option<PathBuf> {
         std::env::var_os("PATH").and_then(|p| {
-            std::env::split_paths(&p).map(|d| d.join(if cfg!(windows) { "node.exe" } else { "node" })).find(|c| c.is_file())
+            std::env::split_paths(&p)
+                .map(|d| d.join(if cfg!(windows) { "node.exe" } else { "node" }))
+                .find(|c| c.is_file())
         })
     }
 
@@ -172,17 +181,29 @@ mod tests {
         let node = node()?;
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(Script::CheckNode.file_name()), js).unwrap();
-        let tc = Toolchain { node, cli_dir: d.path().to_path_buf(), sdk_path: d.path().join("sdk"), home_dir: d.path().join("home") };
+        let tc = Toolchain {
+            node,
+            cli_dir: d.path().to_path_buf(),
+            sdk_path: d.path().join("sdk"),
+            home_dir: d.path().join("home"),
+        };
         Some((d, tc))
     }
 
     fn opts(ms: u64) -> RunOptions {
-        RunOptions { timeout: Duration::from_millis(ms), cancel: CancelToken::new() }
+        RunOptions {
+            timeout: Duration::from_millis(ms),
+            cancel: CancelToken::new(),
+        }
     }
 
     #[test]
     fn captures_and_parses() {
-        let Some((_d, tc)) = setup(r#"console.error("progress"); console.log(JSON.stringify({status:"success",result:{home:process.env.HOME.endsWith('home'),sdkenv:process.env.TIZEN_SDK_PATH===undefined}}))"#) else { return };
+        let Some((_d, tc)) = setup(
+            r#"console.error("progress"); console.log(JSON.stringify({status:"success",result:{home:process.env.HOME.endsWith('home'),sdkenv:process.env.TIZEN_SDK_PATH===undefined}}))"#,
+        ) else {
+            return;
+        };
         let out = run(&tc, &Invocation::check_node(), &opts(10_000)).unwrap();
         assert_eq!(out.exit_code, Some(0));
         assert!(out.stderr.contains("progress"));
@@ -191,28 +212,40 @@ mod tests {
 
     #[test]
     fn times_out() {
-        let Some((_d, tc)) = setup("setInterval(()=>{},1000)") else { return };
+        let Some((_d, tc)) = setup("setInterval(()=>{},1000)") else {
+            return;
+        };
         let t = Instant::now();
-        assert!(matches!(run(&tc, &Invocation::check_node(), &opts(300)), Err(RunError::Timeout(_))));
+        assert!(matches!(
+            run(&tc, &Invocation::check_node(), &opts(300)),
+            Err(RunError::Timeout(_))
+        ));
         assert!(t.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
     fn cancels() {
-        let Some((_d, tc)) = setup("setInterval(()=>{},1000)") else { return };
+        let Some((_d, tc)) = setup("setInterval(()=>{},1000)") else {
+            return;
+        };
         let o = opts(30_000);
         let c = o.cancel.clone();
         let h = thread::spawn(move || {
             thread::sleep(Duration::from_millis(200));
             c.cancel();
         });
-        assert!(matches!(run(&tc, &Invocation::check_node(), &o), Err(RunError::Cancelled)));
+        assert!(matches!(
+            run(&tc, &Invocation::check_node(), &o),
+            Err(RunError::Cancelled)
+        ));
         h.join().unwrap();
     }
 
     #[test]
     fn unexpected_exit_without_envelope() {
-        let Some((_d, tc)) = setup("process.exit(3)") else { return };
+        let Some((_d, tc)) = setup("process.exit(3)") else {
+            return;
+        };
         let out = run(&tc, &Invocation::check_node(), &opts(10_000)).unwrap();
         assert_eq!(out.exit_code, Some(3));
         assert!(out.envelope.is_none());
@@ -221,9 +254,19 @@ mod tests {
     #[test]
     fn missing_script_and_bad_node() {
         let Some((d, mut tc)) = setup("") else { return };
-        assert!(matches!(run(&tc, &Invocation::scan(None, 26101, 1000).unwrap(), &opts(1000)), Err(RunError::ScriptMissing)));
+        assert!(matches!(
+            run(
+                &tc,
+                &Invocation::scan(None, 26101, 1000).unwrap(),
+                &opts(1000)
+            ),
+            Err(RunError::ScriptMissing)
+        ));
         tc.node = d.path().join("no-such-node");
-        assert!(matches!(run(&tc, &Invocation::check_node(), &opts(1000)), Err(RunError::Spawn(_))));
+        assert!(matches!(
+            run(&tc, &Invocation::check_node(), &opts(1000)),
+            Err(RunError::Spawn(_))
+        ));
     }
 }
 
@@ -242,24 +285,53 @@ mod e2e_mock_sdb {
 
     #[test]
     fn init_connect_duid_through_real_scripts() {
-        let Some(node) = std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("node")).find(|c| c.is_file())) else { return };
+        let Some(node) = std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join("node"))
+                .find(|c| c.is_file())
+        }) else {
+            return;
+        };
         let home = tempfile::tempdir().unwrap();
         let sdk = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(sdk.path().join("tools")).unwrap();
         let mock = repo().join("crates/tvdeploy-core/tests/fixtures/mock-sdk/tools/sdb");
         std::fs::copy(&mock, sdk.path().join("tools/sdb")).unwrap();
-        let tc = Toolchain { node, cli_dir: repo().join("resources/samsung-cli/lib/cli"), sdk_path: sdk.path().to_path_buf(), home_dir: home.path().to_path_buf() };
-        let o = || RunOptions { timeout: Duration::from_secs(60), cancel: CancelToken::new() };
+        let tc = Toolchain {
+            node,
+            cli_dir: repo().join("resources/samsung-cli/lib/cli"),
+            sdk_path: sdk.path().to_path_buf(),
+            home_dir: home.path().to_path_buf(),
+        };
+        let o = || RunOptions {
+            timeout: Duration::from_secs(60),
+            cancel: CancelToken::new(),
+        };
 
-        let init = run(&tc, &Invocation::sdk_init(sdk.path().to_str().unwrap()).unwrap(), &o()).unwrap();
-        assert!(init.envelope.as_ref().unwrap().is_success(), "{}", init.stdout);
+        let init = run(
+            &tc,
+            &Invocation::sdk_init(sdk.path().to_str().unwrap()).unwrap(),
+            &o(),
+        )
+        .unwrap();
+        assert!(
+            init.envelope.as_ref().unwrap().is_success(),
+            "{}",
+            init.stdout
+        );
         assert!(home.path().join(".tizen.sdk.path.config").is_file());
 
         let ip = "192.168.1.5".parse().unwrap();
         let c = run(&tc, &Invocation::connect(ip, 26101), &o()).unwrap();
-        assert_eq!(connect_result(c.envelope.as_ref().unwrap()).unwrap().serial, "192.168.1.5:26101");
+        assert_eq!(
+            connect_result(c.envelope.as_ref().unwrap()).unwrap().serial,
+            "192.168.1.5:26101"
+        );
 
         let d = run(&tc, &Invocation::acquire_duid(ip, 26101), &o()).unwrap();
-        assert_eq!(duid_result(d.envelope.as_ref().unwrap()).unwrap().duid, "MOCKDUID1234ABCD");
+        assert_eq!(
+            duid_result(d.envelope.as_ref().unwrap()).unwrap().duid,
+            "MOCKDUID1234ABCD"
+        );
     }
 }
