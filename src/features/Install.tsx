@@ -41,6 +41,12 @@ export function InstallPanel({
   );
 
   useEffect(() => {
+    if (tv) {
+      setProfileName(`TVDeploy-${tv.ip.split(".").at(-1) ?? "TV"}`);
+    }
+  }, [tv?.ip]);
+
+  useEffect(() => {
     if (tvProfiles.length > 0 && !tvProfiles.some((p) => p.name === selectedProfile)) {
       setSelectedProfile(tvProfiles[0].name);
     } else if (tvProfiles.length === 0) {
