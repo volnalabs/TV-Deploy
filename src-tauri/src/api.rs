@@ -179,13 +179,13 @@ pub async fn install_samsung_sdk(
     })
     .await
     .map_err(|_| ApiError::new("internal"))?;
-    let init_ok = matches!(&init, Ok(o) if o.exit_code == Some(0) && o.envelope.as_ref().map(|e| e.is_success()).unwrap_or(false));
+    let init = init.map_err(|e| ApiError { code: "sdk_init_failed".into(), detail: Some(e.to_string()) })?;
+    let init_ok = init.exit_code == Some(0)
+        && init.envelope.as_ref().map(|e| e.is_success()).unwrap_or(false);
     if !init_ok {
         return Err(ApiError {
             code: "sdk_init_failed".into(),
-            detail: Some(init.err().map(|e| e.to_string()).unwrap_or_else(|| {
-                init.ok().map(|o| o.stderr).unwrap_or_default()
-            })),
+            detail: Some(diagnostics::redact(&init.stderr.chars().take(2500).collect::<String>())),
         });
     }
 
@@ -303,10 +303,12 @@ pub async fn create_samsung_certificate(
     let distributor = Invocation::generate_samsung_distributor(&profile_name, &duid)?;
     let create_profile = Invocation::create_samsung_profile(&profile_name)?;
     let password_env = vec![("TIZEN_CERTIFICATE_PASSWORD".to_string(), password)];
+    let profile_worker = profile_name.clone();
+    let duid_worker = duid.clone();
 
     let result = tauri::async_runtime::spawn_blocking(move || {
         let data_dir = sdk_data_dir(&tc.sdk_path);
-        let profile_dir = data_dir.join("keystore").join("samsung").join(&profile_name);
+        let profile_dir = data_dir.join("keystore").join("samsung").join(&profile_worker);
         let author_p12 = profile_dir.join("author.p12");
         let distributor_p12 = profile_dir.join("distributor.p12");
 
@@ -336,7 +338,7 @@ pub async fn create_samsung_certificate(
             cli_success(&distributor_out, "certificate_failed")?;
         } else {
             let csr = fs::read_to_string(profile_dir.join("distributor.csr")).unwrap_or_default();
-            if !csr.contains(&format!("URN:tizen:deviceid={duid}")) {
+            if !csr.contains(&format!("URN:tizen:deviceid={duid_worker}")) {
                 return Err(ApiError {
                     code: "profile_duid_mismatch".into(),
                     detail: Some("A distributor certificate with this profile name already exists for a different TV. Choose another profile name.".into()),
