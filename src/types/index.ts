@@ -25,8 +25,14 @@ export interface SavedDevice { ip: string; port: number; name: string; duid: str
 export interface Settings {
   theme: "system" | "light" | "dark"; language: "auto" | "ru" | "en";
   sdk_path: string | null; default_port: number; timeout_ms: number; devices: SavedDevice[];
+  certificate_profiles: CertificateProfile[];
+}
+export interface CertificateProfile { name: string; identity: string; duid: string }
+export interface InstalledPackage {
+  app_name: string | null; app_id: string | null; version: string | null;
+  signed_package_path: string; tv_ip: string;
 }
 export interface ToolchainStatus {
   node: "bundled" | "system" | "missing"; cli_ready: boolean;
-  sdk_path: string | null; sdk_ready: boolean; sdk_required_gb: number;
+  sdk_path: string | null; sdk_ready: boolean; tv_extension_ready: boolean; sdk_required_gb: number;
 }

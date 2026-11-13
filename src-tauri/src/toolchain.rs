@@ -81,6 +81,16 @@ pub fn build(
 
 pub fn sdk_is_usable(p: &Path) -> bool {
     sdb_path(p).is_file()
+        && p.join("sdk.info").is_file()
+        && p.join("tools").join("tizen-core").join(if cfg!(windows) { "tz.exe" } else { "tz" }).is_file()
+}
+
+/// Whether the Samsung TV Extension has been installed by the official installer.
+pub fn tv_sdk_is_usable(p: &Path) -> bool {
+    p.join(".tv-sdk-installed").is_file()
+        || std::fs::read_to_string(p.join(".platform-installed"))
+            .map(|s| s.contains("TV-SAMSUNG-Public"))
+            .unwrap_or(false)
 }
 
 /// Common places an existing Tizen SDK / Tizen Studio may live. We only *look*; we never touch

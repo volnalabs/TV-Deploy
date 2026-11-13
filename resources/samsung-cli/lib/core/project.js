@@ -1,0 +1,2590 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Samsung Electronics Co., Ltd.
+
+/**
+ * Project domain: create / import / build / list templates / install app
+ *
+ * Each function executes its corresponding script under scripts/, and instead of
+ * extensive toolchain output, summarizes key lines and returns as Standard JSON Envelope.
+ */
+
+const os = require("os");
+const fs = require("fs");
+const path = require("path");
+const {
+  formatProjectBuild,
+  formatError,
+} = require("../envelope/response-formatter");
+const { Envelope } = require("../envelope/envelope");
+const { resolveScript, execPluginScript } = require("./plugin-cache");
+const { checkShellSafe } = require("./shell-safety");
+const { rawOutputTail } = require("./emulator");
+const {
+  summarizeOutput,
+  extractBuildDiagnostics,
+} = require("./output-summary");
+const { preflightSigningProfile } = require("./certificate");
+const {
+  readSdkPath,
+  repairSdkInfo,
+  describeSdkInfoRepair,
+  describeChildExit,
+  validateTizenVersion,
+  isPlatformInstalled,
+  isTvVersionRecorded,
+  listFullyInstalledPlatformVersions,
+  comparePlatformVersions,
+} = require("./sdk");
+const {
+  resolveSdbBinary,
+  resolveSerial,
+  ensureSdbServer,
+  describeSerialFailure,
+} = require("./sdb");
+const {
+  detectAppType,
+  rdsStateExists,
+  resetAllRdsState,
+  saveBuildManifest,
+  scanInputFilesAsync,
+  scanOutputFilesAsync,
+  tryRdsDeploy,
+  updateRdsState,
+  parseWebAppId,
+  parseManifestAppId,
+} = require("./rds");
+
+const VALID_PROJECT_TYPES = [
+  "native",
+  "dotnet",
+  "webapp",
+  "rpk",
+  "tv",
+  "platform",
+];
+
+function isPlatformProject(projectPath) {
+  const packagingDir = path.join(projectPath, "packaging");
+  return (
+    fs.existsSync(path.join(projectPath, "CMakeLists.txt")) &&
+    fs.existsSync(packagingDir) &&
+    fs.readdirSync(packagingDir).some((entry) => entry.endsWith(".spec"))
+  );
+}
+
+/**
+ * Target architectures for `gbs build -A` on Platform projects — the same list
+ * the tizen-cli `--arch` option accepts. x86_64 (default) and i586 run on the
+ * emulator; armv7l is 32-bit ARM and aarch64 is 64-bit ARM hardware.
+ */
+const GBS_ARCHES = ["armv7l", "aarch64", "i586", "x86_64"];
+const DEFAULT_GBS_ARCH = "x86_64";
+
+/**
+ * Standalone RPK resource projects are packaged by the legacy `tizen` CLI
+ * (`tizen package -t rpk`), not by `tz build`/`tz pack`. Mirrors the marker
+ * the build scripts use to pick that path.
+ */
+function isRpkProject(projectPath) {
+  return fs.existsSync(path.join(projectPath, "tizen_resource_project.yaml"));
+}
+
+/**
+ * RDS kill switch — `TIZEN_RDS_ENABLED=0` reverts build/install to today's
+ * exact behavior, with no RDS entry point engaged in either path.
+ *
+ * @returns {boolean}
+ */
+function rdsEnabled() {
+  return process.env.TIZEN_RDS_ENABLED !== "0";
+}
+
+/**
+ * Tizen package IDs must be exactly 10 alphanumeric characters.
+ * If the app name produces a package ID shorter than 10 characters,
+ * `tz install` will fail with "Load archive info fail" / "Operation not allowed [-4]".
+ *
+ * This function checks whether the app name will produce a valid 10-char package ID.
+ * Tizen derives the package ID from the app name by taking the first 10 alphanumeric
+ * characters (lowercased). If fewer than 10 alphanumeric characters are available,
+ * the package ID will be shorter than 10 characters and installation will fail.
+ *
+ * @param {string} appName - the app name passed to createProject
+ * @returns {{valid: boolean, packageId: string, message: string|null}}
+ */
+function validatePackageId(appName) {
+  // Extract alphanumeric characters from the app name (Tizen lowercases them)
+  const alphanumeric = appName.replace(/[^A-Za-z0-9]/g, "").toLowerCase();
+  const packageId = alphanumeric.slice(0, 10);
+
+  if (packageId.length < 10) {
+    return {
+      valid: false,
+      packageId,
+      message:
+        `App name "${appName}" produces a package ID "${packageId}" that is only ${packageId.length} characters long. ` +
+        "Tizen requires exactly 10 alphanumeric characters. " +
+        'Installation will fail with "Load archive info fail" / "Operation not allowed [-4]". ' +
+        'Please use an app name with at least 10 alphanumeric characters (e.g., "MyTizenApp01").',
+    };
+  }
+
+  return { valid: true, packageId, message: null };
+}
+
+/**
+ * Check whether a directory looks like a Tizen project.
+ *
+ * Guards the destructive paths (deleteProject, createProject --force): a
+ * directory is only ever removed when it carries at least one well-known
+ * Tizen project marker, so a mistyped path can never wipe an unrelated
+ * directory.
+ *
+ * @param {string} dir - absolute directory path
+ * @returns {boolean}
+ */
+function isTizenProjectDir(dir) {
+  // These file NAMES only ever appear in Tizen projects, so their presence
+  // alone is sufficient.
+  const STRONG_MARKERS = [
+    "tizen_native_project.yaml",
+    "tizen_dotnet_project.yaml",
+    "tizen_web_project.yaml",
+    "tizen_resource_project.yaml",
+    "tizen-manifest.xml",
+    "project_def.prop",
+    ".tproject",
+  ];
+  // First 64KB is plenty to find the Tizen namespace / TFM near the top of
+  // config.xml or a .csproj without reading arbitrarily large files.
+  const readHead = (p) => {
+    try {
+      const fd = fs.openSync(p, "r");
+      try {
+        const buf = Buffer.alloc(64 * 1024);
+        const n = fs.readSync(fd, buf, 0, buf.length, 0);
+        return buf.toString("utf-8", 0, n);
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (_e) {
+      return "";
+    }
+  };
+  const hasMarker = (d) => {
+    if (STRONG_MARKERS.some((f) => fs.existsSync(path.join(d, f)))) return true;
+    // config.xml is a generic file name used by many tools — only count it
+    // when it is actually a Tizen widget config (tizen.org namespace), so a
+    // stray tool config can never qualify a directory for recursive deletion.
+    const configXml = path.join(d, "config.xml");
+    if (fs.existsSync(configXml) && /tizen\.org/i.test(readHead(configXml))) {
+      return true;
+    }
+    const entries = fs.readdirSync(d);
+    // Same for .csproj: only a project that actually references Tizen
+    // (Tizen.NET package / net*-tizen TFM) counts. A bare .sln says nothing
+    // about Tizen and is deliberately NOT accepted — a workspace folder whose
+    // subfolder happens to hold a solution must never be deletable.
+    if (
+      entries.some(
+        (e) => /\.csproj$/i.test(e) && /tizen/i.test(readHead(path.join(d, e))),
+      )
+    ) {
+      return true;
+    }
+    // GBS platform project: CMakeLists.txt + packaging/*.spec
+    return (
+      entries.includes("CMakeLists.txt") &&
+      fs.existsSync(path.join(d, "packaging")) &&
+      fs.readdirSync(path.join(d, "packaging")).some((e) => e.endsWith(".spec"))
+    );
+  };
+  try {
+    if (hasMarker(dir)) return true;
+    // DotNET solution layout (tz new scaffolds Solution/Solution.sln +
+    // Solution/Project/Project.csproj): markers live one level down. Only
+    // descend when the directory itself carries solution evidence (*.sln) —
+    // without that requirement, a WORKSPACE folder that merely contains
+    // Tizen projects (e.g. ~/tizen-apps, or a home dir with one project in
+    // it) would qualify as "a Tizen project" and become deletable as a whole.
+    if (!fs.readdirSync(dir).some((e) => /\.sln$/i.test(e))) return false;
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .some((e) => {
+        try {
+          return hasMarker(path.join(dir, e.name));
+        } catch (_err) {
+          return false;
+        }
+      });
+  } catch (_e) {
+    return false;
+  }
+}
+
+/**
+ * Paths deleteProject / createProject(force) must never remove, even when a
+ * project marker matches: filesystem roots, the home directory, and any
+ * ancestor of the home directory (C:\Users, /home, ...).
+ *
+ * Expects a PHYSICAL path (fs.realpathSync) — callers resolve symlinks first,
+ * because path.resolve() alone is lexical and a symlinked parent would
+ * otherwise dodge these comparisons.
+ */
+function isProtectedPath(realPath) {
+  const realHome = fs.realpathSync.native(path.resolve(os.homedir()));
+  // Windows paths are case-insensitive; the two sides may also disagree on
+  // 8.3 short names, which realpathSync.native has already expanded.
+  const norm = (p) => (process.platform === "win32" ? p.toLowerCase() : p);
+  const withSep = (p) => (p.endsWith(path.sep) ? p : p + path.sep);
+  return (
+    path.dirname(realPath) === realPath ||
+    norm(realPath) === norm(realHome) ||
+    norm(withSep(realHome)).startsWith(norm(withSep(realPath)))
+  );
+}
+
+/**
+ * Extract only key lines from project create script stdout for envelope warnings
+ *
+ * Remove banners (====), creation info (name/template/path — already in result field),
+ * and "Next steps:" guidance (redundant with agent Handoff docs), keeping only
+ * unique info not in result (workspace files, warnings/errors).
+ *
+ * @param {string} output - script stdout
+ * @returns {string[]} warnings array (key lines only, typically 0-3 lines)
+ */
+function summarizeCreateProjectOutput(output) {
+  // "Next steps:" onwards is build/install guidance — redundant with agent Handoff docs, so discard
+  return summarizeOutput(output, {
+    keep: /\.code-workspace|workspace|warning|error|manual|unavailable|fail/i,
+    stopAt: /^Next steps:/i,
+  });
+}
+
+/**
+ * Patch the tizen-manifest.xml of a newly created RPK project to use a unique
+ * res-type, preventing device package-manager registration conflicts.
+ *
+ * The SDK's rpk_app template hardcodes res-type="tizen.sample.resource" and
+ * res-version="1.5.0" for every project. The device's package_res_info table
+ * has PRIMARY KEY(res_type, res_version), so a second RPK with the same
+ * res-type/res-version fails with error -21 ("Register application error [-21]").
+ *
+ * This function replaces the template's res-type with the project's package ID
+ * (e.g. "org.example.myapp"), making each RPK's resource type unique. It also
+ * renames the res/ subdirectories to match the new res-type so the resource
+ * layout stays consistent.
+ *
+ * @param {string} projectPath - the RPK project root directory
+ */
+function patchRpkManifestResType(projectPath) {
+  const manifestPath = path.join(projectPath, "tizen-manifest.xml");
+  if (!fs.existsSync(manifestPath)) return;
+
+  let manifestContent = fs.readFileSync(manifestPath, "utf-8");
+
+  // Extract the package ID from the manifest
+  const pkgMatch = manifestContent.match(/package="([^"]+)"/);
+  if (!pkgMatch) return;
+  const packageId = pkgMatch[1];
+
+  // Extract the current res-type
+  const resTypeMatch = manifestContent.match(/res-type="([^"]+)"/);
+  if (!resTypeMatch) return;
+  const oldResType = resTypeMatch[1];
+
+  // Already patched (res-type equals package ID) — nothing to do
+  if (oldResType === packageId) return;
+
+  // Replace res-type with the package ID to make it unique
+  manifestContent = manifestContent.replace(
+    /res-type="[^"]*"/,
+    `res-type="${packageId}"`,
+  );
+
+  fs.writeFileSync(manifestPath, manifestContent, "utf-8");
+  console.error(
+    `[tizen-project] Patched RPK manifest: res-type "${oldResType}" -> "${packageId}" (prevents -21 registration conflict)`,
+  );
+
+  // Rename res/ subdirectories to match the new res-type.
+  // The template creates res/allowed/<old-res-type>/ and res/global/<old-res-type>/
+  // The device package-manager uses these paths to locate resources by res-type.
+  const resDir = path.join(projectPath, "res");
+  if (fs.existsSync(resDir)) {
+    for (const scope of ["allowed", "global"]) {
+      const oldDir = path.join(resDir, scope, oldResType);
+      const newDir = path.join(resDir, scope, packageId);
+      if (fs.existsSync(oldDir) && oldDir !== newDir) {
+        fs.renameSync(oldDir, newDir);
+        console.error(
+          `[tizen-project] Renamed res/${scope}/${oldResType} -> res/${scope}/${packageId}`,
+        );
+      }
+    }
+  }
+
+  // Also update tizen_resource_project.yaml if it references the old res-type
+  // in its resources list (the res/ paths don't include res-type, but keep
+  // the yaml consistent in case future templates add res-type references).
+  const yamlPath = path.join(projectPath, "tizen_resource_project.yaml");
+  if (fs.existsSync(yamlPath)) {
+    let yamlContent = fs.readFileSync(yamlPath, "utf-8");
+    if (yamlContent.includes(oldResType)) {
+      yamlContent = yamlContent.split(oldResType).join(packageId);
+      fs.writeFileSync(yamlPath, yamlContent, "utf-8");
+    }
+  }
+}
+
+/**
+ * Create Tizen project
+ *
+ * Creates project at `<parentPath>/<appName>/` location.
+
+ *
+ * @param {string} type - project type (native, dotnet, webapp)
+ * @param {string} template - template name selected by user from listTemplates() result
+ * @param {string} parentPath - workspace (parent) directory — not the app folder itself!
+ * @param {string} appName - app name = name of folder to be created
+ * @param {boolean} [force] - if the target folder already exists, replace it
+ *   (only when it is empty or looks like a Tizen project — never an arbitrary dir)
+ * @returns {object} Standard JSON Envelope
+ */
+/**
+ * Script arguments that pin create-project / list-templates to TIZEN-X.Y.
+ *
+ * With a version, it must be X.Y and installed (isPlatformInstalled: a
+ * platforms/tizen-X.Y/common directory alone is not a platform), otherwise
+ * `tz new -p tizen-X.Y` would fail later with a less helpful message.
+ * Without one, the newest installed platform is pinned — the same version
+ * platform-list reports as result.newest. The script's own detection (the
+ * highest tizen-X.Y section of `tz list templates`) also lists versions that
+ * hold only "common", so it is left to fall back on only when no platform
+ * passes isPlatformInstalled.
+ *
+ * @param {string} platformVersion - "X.Y", or "" for the newest installed one
+ * @param {string} command - envelope command name
+ * @param {number} startTime
+ * @returns {{win: string, unix: string, error?: object}} argument suffixes
+ *   (leading space included) or an error envelope
+ */
+function platformVersionArgs(platformVersion, command, startTime) {
+  if (!platformVersion) {
+    const newest = listFullyInstalledPlatformVersions(readSdkPath()).pop();
+    return newest ? tzProfileArgs(newest) : { win: "", unix: "" };
+  }
+  const check = validateTizenVersion(platformVersion, { required: true });
+  if (check.error) {
+    return {
+      error: formatError(
+        command,
+        "invalid_argument",
+        check.error,
+        null,
+        startTime,
+      ),
+    };
+  }
+  const version = check.version;
+  const sdkPath = readSdkPath();
+  if (!isPlatformInstalled(sdkPath, version)) {
+    const installed = listFullyInstalledPlatformVersions(sdkPath);
+    const install = `tizen-sdk platform-install --platform-version ${version}`;
+    return {
+      error: formatError(
+        command,
+        "platform_version_not_found",
+        `Platform TIZEN-${version} is not installed in ${sdkPath} (installed platforms: ${installed.join(", ") || "none"}). ` +
+          `Install it with "${install}", or omit --platform-version to use the newest installed platform.`,
+        install,
+        startTime,
+      ),
+    };
+  }
+  return { ...tzProfileArgs(version, true), version };
+}
+
+/**
+ * TIZEN versions whose Samsung TV extension is installed — the same test as
+ * detect_tv_profile / Detect-TvProfile: `tz` lists tv-samsung-X.Y AND the SDK
+ * has platforms/tizen-X.Y/tv-samsung or platforms/tv-samsung-X.Y. The tz
+ * profile list alone also names TV profiles whose extension is absent.
+ *
+ * @param {string} sdkPath
+ * @param {string[]} tzProfiles - profile names `tz list templates` reported
+ * @returns {string[]} "X.Y" versions
+ */
+function installedTvVersions(sdkPath, tzProfiles) {
+  return tzProfiles
+    .map((p) => /^tv-samsung-(\d+\.\d+)$/.exec(p))
+    .filter(Boolean)
+    .map((m) => m[1])
+    .filter((v) => hasTvExtensionDir(sdkPath, v));
+}
+
+/** Does the SDK have the TV extension directory of TIZEN-X.Y? */
+function hasTvExtensionDir(sdkPath, version) {
+  const isDir = (p) => {
+    try {
+      return fs.statSync(p).isDirectory();
+    } catch (_e) {
+      return false;
+    }
+  };
+  return (
+    isDir(path.join(sdkPath, "platforms", `tizen-${version}`, "tv-samsung")) ||
+    isDir(path.join(sdkPath, "platforms", `tv-samsung-${version}`))
+  );
+}
+
+/** "X.Y" versions with a TV extension directory, oldest first (no tz needed). */
+function tvVersionsOnDisk(sdkPath) {
+  let names;
+  try {
+    names = fs.readdirSync(path.join(sdkPath, "platforms"));
+  } catch (_e) {
+    return [];
+  }
+  const versions = new Set();
+  for (const name of names) {
+    const m = /^(?:tizen|tv-samsung)-(\d+\.\d+)$/i.exec(name);
+    if (m && hasTvExtensionDir(sdkPath, m[1])) versions.add(m[1]);
+  }
+  return [...versions].sort((a, b) => {
+    const [am, an] = a.split(".").map(Number);
+    const [bm, bn] = b.split(".").map(Number);
+    return am - bm || an - bn;
+  });
+}
+
+/**
+ * The two ways to get the TV extension of TIZEN-X.Y: tizen-tv-sdk-install
+ * installs the one version the online repository carries, a TV SDK ZIP can
+ * hold any version. Both installers skip only a TV version that
+ * .platform-installed already records (isTvVersionRecorded), so --force
+ * follows that version's record: adding another TV version needs none.
+ */
+function tvInstallSteps(version, sdkPath) {
+  const f = isTvVersionRecorded(sdkPath, version) ? " --force" : "";
+  return (
+    `install it with tizen-tv-sdk-install${f} if the repository's TV package is for TIZEN-${version}, ` +
+    `or from a TIZEN-${version} TV SDK ZIP with tizen-tv-sdk-install-from-zip --zip-path <zip> --tv-version ${version}${f}`
+  );
+}
+
+/**
+ * The message for an explicit --platform-version whose TV extension is
+ * missing — shared by create-project and list-templates so both point at the
+ * same fix: another version when one has the extension, or installing it
+ * online or from a ZIP.
+ */
+function tvVersionMissingMessage(version, installed, sdkPath) {
+  const others = installed.filter((v) => v !== version);
+  return others.length
+    ? `The Samsung TV SDK extension is not installed for TIZEN-${version} (installed for: ${others.join(", ")}). ` +
+        "Omit --platform-version to use the newest installed TV profile, or pass one of those versions. " +
+        `To add TIZEN-${version}, ${tvInstallSteps(version, sdkPath)}.`
+    : `The Samsung TV SDK extension is not installed for TIZEN-${version}. ` +
+        `To add it, ${tvInstallSteps(version, sdkPath)}; or omit --platform-version.`;
+}
+
+/**
+ * The --tz-profile / -TzProfile suffixes for TIZEN-X.Y (leading space
+ * included). `strict` adds --strict-profile / -StrictProfile for a version the
+ * user asked for: TV projects then use tv-samsung-X.Y or fail, instead of the
+ * newest TV profile the scripts pick otherwise (an SDK whose newest platform is
+ * 11.0 can have the TV extension on 10.0 only, so the default pin stays loose).
+ */
+function tzProfileArgs(version, strict = false) {
+  return {
+    win: ` -TzProfile "tizen-${version}"${strict ? " -StrictProfile" : ""}`,
+    unix: ` --tz-profile=tizen-${version}${strict ? " --strict-profile" : ""}`,
+  };
+}
+
+async function createProject(
+  type,
+  template,
+  parentPath,
+  appName,
+  force = false,
+  command = "tizen-sdk create-project",
+  open = false,
+  platformVersion = "",
+) {
+  // Start time: pass to success/failure responses so duration_ms reflects actual work time
+  const startTime = Date.now();
+  try {
+    if (!type || !template || !parentPath || !appName) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "Missing required parameters: type, template, parentPath, appName",
+        'createProject("dotnet", "TizenNUITemplate", "/path/to", "MyTizenDotnetApp")',
+        startTime,
+      );
+    }
+
+    if (!VALID_PROJECT_TYPES.includes(type.toLowerCase())) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid project type: ${type}. Must be one of: ${VALID_PROJECT_TYPES.join(", ")}`,
+        null,
+        startTime,
+      );
+    }
+
+    // Validate that the app name will produce a valid 10-character package ID.
+    // Tizen requires exactly 10 alphanumeric characters; shorter IDs cause
+    // "Load archive info fail" / "Operation not allowed [-4]" at install time.
+    const pkgIdCheck = validatePackageId(appName);
+    if (!pkgIdCheck.valid) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        pkgIdCheck.message,
+        'Use an app name with at least 10 alphanumeric characters, e.g., "MyTizenApp01"',
+        startTime,
+      );
+    }
+
+    // Normalize path: avoid backslash being interpreted as escape in MSYS2/Git Bash
+
+    const normalizedParentPath = path.resolve(parentPath);
+    console.error(
+      `[tizen-project] Using parent directory: ${normalizedParentPath}`,
+    );
+
+    if (!fs.existsSync(normalizedParentPath)) {
+      return formatError(
+        command,
+        "io_error",
+        `Parent directory does not exist: ${normalizedParentPath}\nPlease ensure the directory exists or use the current working directory.`,
+        `createProject("${type}", "${template}", "${process.cwd()}", "${appName}")`,
+        startTime,
+      );
+    }
+
+    // Pre-check the target folder. Without this, an existing directory either
+    // breaks `tz new` or silently merges — and a remote MCP client has no way
+    // to delete it beforehand (a local rm -rf runs on the wrong machine).
+    const targetPath = path.resolve(normalizedParentPath, appName);
+    if (path.dirname(targetPath) !== normalizedParentPath) {
+      // appName must be a plain folder name — a separator or ".." would make
+      // the exists/replace logic (and tz new itself) act outside parentPath.
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid app name "${appName}": it must be a plain folder name without path separators.`,
+        null,
+        startTime,
+      );
+    }
+    // Whether an existing target must be removed before `tz new` runs. The
+    // removal itself happens only after EVERY remaining validation below has
+    // passed — a rejected app name / template / parent path / missing script
+    // must never cost the user the project they asked to replace.
+    let replaceExisting = false;
+    if (fs.existsSync(targetPath)) {
+      // A symlink here is ambiguous (replace the link? the target?) and rmSync
+      // would only unlink the link anyway — make the caller resolve it.
+      if (fs.lstatSync(targetPath).isSymbolicLink()) {
+        return formatError(
+          command,
+          "invalid_parameters",
+          `Refusing to replace ${targetPath}: it is a symbolic link. Remove it manually first.`,
+          null,
+          startTime,
+        );
+      }
+      // Same protected-path rule as deleteProject: even with force, never
+      // remove the home directory, an ancestor of it, or a filesystem root.
+      // The replace gate must not rest on marker heuristics alone — e.g.
+      // parentPath=C:\Users, appName=<username> must die HERE.
+      const realTarget = fs.realpathSync.native(targetPath);
+      if (isProtectedPath(realTarget)) {
+        return formatError(
+          command,
+          "invalid_parameters",
+          `Refusing to replace ${realTarget}: protected directory (home, ancestor of home, or filesystem root).`,
+          null,
+          startTime,
+        );
+      }
+      const isEmpty = fs.readdirSync(targetPath).length === 0;
+      if (!force && !isEmpty) {
+        return formatError(
+          command,
+          "project_creation_failed",
+          `Target folder already exists: ${targetPath}. Pass force=true (--force) to replace it, or delete it first with the delete-project command.`,
+          null,
+          startTime,
+        );
+      }
+      if (force && !isEmpty && !isTizenProjectDir(targetPath)) {
+        // force only replaces something we can positively identify as a Tizen
+        // project (or an empty dir) — never an arbitrary non-empty directory.
+        return formatError(
+          command,
+          "invalid_parameters",
+          `Refusing to replace ${targetPath}: it exists but does not look like a Tizen project (no tizen_*_project.yaml / .tproject / tizen-manifest.xml / project_def.prop marker, no Tizen config.xml or Tizen .csproj). Delete it manually if replacement is really intended.`,
+          null,
+          startTime,
+        );
+      }
+      replaceExisting = true;
+    }
+
+    // These values are interpolated into a shell command line below — reject
+    // shell metacharacters (template names may contain spaces/dots)
+    if (!/^[A-Za-z0-9._-]+$/.test(appName)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid app name "${appName}": only letters, digits, '.', '_' and '-' are allowed.`,
+        null,
+        startTime,
+      );
+    }
+    if (!/^[A-Za-z0-9._\s-]+$/.test(template)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid template name "${template}".`,
+        null,
+        startTime,
+      );
+    }
+    // The parent path is spliced into the same command line — path.resolve()
+    // above does nothing about shell metacharacters.
+    const unsafeParent = checkShellSafe(
+      normalizedParentPath,
+      "parent path",
+      command,
+      startTime,
+    );
+    if (unsafeParent) return unsafeParent;
+
+    const resolved = resolveScript("tizen-create-project");
+    if (resolved.error) {
+      return formatError(command, "io_error", resolved.error, null, startTime);
+    }
+
+    const versionArgs = platformVersionArgs(
+      platformVersion,
+      command,
+      startTime,
+    );
+    if (versionArgs.error) return versionArgs.error;
+
+    // A TV project for an explicit version needs that version's TV extension.
+    // Without this check the script failed later with "Install TV SDK
+    // extension first" and an empty template list — the wrong fix when the
+    // extension is installed for another version.
+    if (type.toLowerCase() === "tv" && versionArgs.version) {
+      const sdkPath = readSdkPath();
+      if (!hasTvExtensionDir(sdkPath, versionArgs.version)) {
+        return formatError(
+          command,
+          "platform_version_not_found",
+          tvVersionMissingMessage(
+            versionArgs.version,
+            tvVersionsOnDisk(sdkPath),
+            sdkPath,
+          ),
+          null,
+          startTime,
+        );
+      }
+    }
+
+    // All validation passed — now (and only now) clear the existing target.
+    if (replaceExisting) {
+      console.error(
+        `[tizen-project] ${force ? "--force: removing" : "Removing empty"} existing folder: ${targetPath}`,
+      );
+      try {
+        fs.rmSync(targetPath, { recursive: true, force: true });
+      } catch (error) {
+        return formatError(
+          command,
+          "io_error",
+          `Could not remove existing folder ${targetPath}: ${error.message}`,
+          null,
+          startTime,
+        );
+      }
+    }
+
+    console.error(
+      `[tizen-project] Creating ${type} project: ${appName} at ${normalizedParentPath}`,
+    );
+
+    let output;
+    try {
+      // Pass forward slash paths to Windows script (Node.js compatible)
+      const winPath = normalizedParentPath.replace(/\\/g, "/");
+      // The scripts only launch `code` (workspace open) when explicitly asked.
+      output = execPluginScript(
+        resolved.scriptPath,
+        `-Type "${type}" -Template "${template}" -Path "${winPath}" -Name "${appName}"${open ? " -Open" : ""}${versionArgs.win}`,
+        `--type="${type}" --template="${template}" --path="${normalizedParentPath}" --name="${appName}"${open ? " --open" : ""}${versionArgs.unix}`,
+      );
+    } catch (error) {
+      return formatError(
+        command,
+        "project_creation_failed",
+        `Project creation failed: ${error.message}` +
+          (replaceExisting
+            ? " (the previous folder was removed as requested before the scaffold ran)"
+            : ""),
+        null,
+        startTime,
+      );
+    }
+
+    // Success validation: verify project folder exists (more reliable than parsing script output)
+    const projectPath = path.join(normalizedParentPath, appName);
+    if (!fs.existsSync(projectPath)) {
+      return formatError(
+        command,
+        "build_failed",
+        `Project folder was not created at: ${projectPath}`,
+        null,
+        startTime,
+      );
+    }
+
+    // RPK fix: The SDK template hardcodes res-type="tizen.sample.resource" and
+    // res-version="1.5.0" for all RPK projects. The device package-manager
+    // database has PRIMARY KEY(res_type, res_version) on package_res_info, so
+    // installing a second RPK with the same res-type/res-version fails with
+    // error -21 ("Register application error [-21]"). Patch the manifest to
+    // use the package ID as res-type, making each RPK's resource type unique.
+    if (type.toLowerCase() === "rpk") {
+      try {
+        patchRpkManifestResType(projectPath);
+      } catch (e) {
+        // Non-fatal: the project is created, but installation may conflict
+        // with another RPK that has the same res-type. Log a warning.
+        console.error(
+          `[tizen-project] Warning: could not patch RPK manifest res-type: ${e.message}`,
+        );
+      }
+    }
+
+    const envelope = new Envelope(command);
+
+    envelope.startTime = startTime;
+    return envelope.success(
+      {
+        project_name: appName,
+        project_type: type,
+        template_name: template,
+        project_path: projectPath,
+        status: "created",
+      },
+      {
+        // Key lines only (workspace files, warnings) instead of full script banner/guidance (~30 lines)
+        warnings: summarizeCreateProjectOutput(output),
+      },
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to create project: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Build the paired argument strings required by execPluginScript().
+ *
+ * Keep the Windows and Bash mappings in one tested helper: the platform
+ * scripts intentionally use different parameter spellings.
+ *
+ * @param {string} normalizedWgtPath - resolved WGT archive path
+ * @param {string} normalizedProfile - tizen | tv-samsung
+ * @param {string} normalizedVersion - SDK profile version, e.g. 10.0
+ * @param {string} normalizedWorkingDir - resolved workspace path
+ * @returns {{winArgs: string, unixArgs: string}} Platform-specific script arguments
+ */
+function buildImportWgtScriptArgs(
+  normalizedWgtPath,
+  normalizedProfile,
+  normalizedVersion,
+  normalizedWorkingDir,
+) {
+  const windowsWgtPath = normalizedWgtPath.replace(/\\/g, "/");
+  const windowsWorkingDir = normalizedWorkingDir.replace(/\\/g, "/");
+  return {
+    winArgs: [
+      `-WgtPath "${windowsWgtPath}"`,
+      `-Profile "${normalizedProfile}"`,
+      `-PlatformVersion "${normalizedVersion}"`,
+      `-WorkingDir "${windowsWorkingDir}"`,
+    ].join(" "),
+    unixArgs: [
+      `--wgt-path="${normalizedWgtPath}"`,
+      `--profile="${normalizedProfile}"`,
+      `--platform-version="${normalizedVersion}"`,
+      `--working-dir="${normalizedWorkingDir}"`,
+    ].join(" "),
+  };
+}
+
+/**
+ * Import a WGT archive as a Tizen Web project.
+ *
+ * `tz import-wgt` owns archive extraction and project generation.  The runner
+ * deliberately mirrors its output-directory convention rather than attempting
+ * to inspect or rewrite the widget archive itself.
+ *
+ * @param {string} wgtPath - existing .wgt archive; its file name (without
+ *   .wgt) becomes the project name, so tz only accepts [A-Za-z0-9] there
+ * @param {string} profile - tizen | tv-samsung
+ * @param {string} platformVersion - SDK platform version, e.g. 10.0 — the
+ *   script refuses a `<profile>-<version>` that `tz list templates` does not
+ *   list (tz itself would accept it and silently ignore it)
+ * @param {string} workingDir - existing SDK-host workspace directory;
+ *   `<workingDir>/<project name>` must not exist yet
+ * @param {string} command - envelope command label
+ * @returns {object} Standard JSON Envelope
+ */
+async function importWgt(
+  wgtPath,
+  profile,
+  platformVersion,
+  workingDir,
+  command = "tizen-sdk import-wgt",
+) {
+  const startTime = Date.now();
+  try {
+    if (!wgtPath || !profile || !platformVersion || !workingDir) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "Missing required parameters: wgtPath, profile, platformVersion, workingDir",
+        "importWgt('/path/to/MyWidget.wgt', 'tizen', '10.0', '/path/to/workspace')",
+        startTime,
+      );
+    }
+
+    const normalizedWgtPath = path.resolve(wgtPath);
+    const normalizedWorkingDir = path.resolve(workingDir);
+    const normalizedProfile = String(profile).trim().toLowerCase();
+    const normalizedVersion = String(platformVersion).trim();
+
+    if (
+      !fs.existsSync(normalizedWgtPath) ||
+      !fs.statSync(normalizedWgtPath).isFile()
+    ) {
+      return formatError(
+        command,
+        "io_error",
+        `WGT file does not exist: ${normalizedWgtPath}`,
+        null,
+        startTime,
+      );
+    }
+    if (path.extname(normalizedWgtPath).toLowerCase() !== ".wgt") {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid WGT file: ${normalizedWgtPath}. Expected a .wgt archive.`,
+        null,
+        startTime,
+      );
+    }
+    if (!["tizen", "tv-samsung"].includes(normalizedProfile)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid profile: ${profile}. Must be tizen or tv-samsung.`,
+        null,
+        startTime,
+      );
+    }
+    if (!/^\d+\.\d+$/.test(normalizedVersion)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid platform version: ${platformVersion}. Use <major>.<minor>, such as 10.0.`,
+        null,
+        startTime,
+      );
+    }
+    if (
+      !fs.existsSync(normalizedWorkingDir) ||
+      !fs.statSync(normalizedWorkingDir).isDirectory()
+    ) {
+      return formatError(
+        command,
+        "io_error",
+        `Working directory does not exist: ${normalizedWorkingDir}`,
+        null,
+        startTime,
+      );
+    }
+
+    for (const [value, label] of [
+      [normalizedWgtPath, "WGT path"],
+      [normalizedWorkingDir, "working directory"],
+    ]) {
+      const unsafe = checkShellSafe(value, label, command, startTime);
+      if (unsafe) return unsafe;
+    }
+
+    // `tz import-wgt` names the project after the archive file name and only
+    // accepts [a-zA-Z0-9] there — `my-app.wgt` or `Weather.Widget.wgt` die
+    // inside tz with "tz: error: can only have [a-zA-Z0-9]" and no hint that
+    // renaming the file is the fix. Say so before running anything.
+    const wgtFileName = path.basename(normalizedWgtPath);
+    const projectName = path.basename(
+      normalizedWgtPath,
+      path.extname(normalizedWgtPath),
+    );
+    if (!/^[A-Za-z0-9]+$/.test(projectName)) {
+      const suggested = projectName.replace(/[^A-Za-z0-9]/g, "") || "MyWidget";
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid WGT file name "${wgtFileName}": tz import-wgt names the project after the file and allows only letters and digits [A-Za-z0-9] (no '.', '-', '_' or spaces). Rename the archive (for example ${suggested}.wgt) and retry.`,
+        null,
+        startTime,
+      );
+    }
+
+    // Pre-check the target folder like createProject does: tz refuses to
+    // import over an existing directory ("tz: error: <name> already exists")
+    // and a remote MCP client cannot clean it up with a local rm -rf.
+    const projectPath = path.join(normalizedWorkingDir, projectName);
+    if (fs.existsSync(projectPath)) {
+      return formatError(
+        command,
+        "project_creation_failed",
+        `Target folder already exists: ${projectPath}. Delete it first with the delete action (project-delete), or import into a different --working-dir.`,
+        null,
+        startTime,
+      );
+    }
+
+    const resolved = resolveScript("tizen-import-wgt");
+    if (resolved.error)
+      return formatError(command, "io_error", resolved.error, null, startTime);
+
+    let output;
+    try {
+      const args = buildImportWgtScriptArgs(
+        normalizedWgtPath,
+        normalizedProfile,
+        normalizedVersion,
+        normalizedWorkingDir,
+      );
+      output = execPluginScript(
+        resolved.scriptPath,
+        args.winArgs,
+        args.unixArgs,
+      );
+    } catch (error) {
+      // execSync's message is "Command failed: <cmd line>" — the script's real
+      // diagnostic ([ERROR] ..., "tz: error: ...") is on stderr. Surface it.
+      // Colour codes are stripped (log_error may emit them) and the fallback
+      // is the FIRST line: PowerShell wraps unstructured stderr at console
+      // width, so the last line can be a fragment.
+      const scriptOutput = `${error.stderr || ""}\n${error.stdout || ""}`;
+      const lines = scriptOutput
+        // eslint-disable-next-line no-control-regex
+        .replace(/\x1b\[[0-9;]*m/g, "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+      const diag =
+        lines.find((line) => /^(\[ERROR\]|Error:|tz: error:)/i.test(line)) ||
+        lines[0] ||
+        error.message;
+      return formatError(
+        command,
+        "project_creation_failed",
+        `WGT import failed: ${diag}`,
+        null,
+        startTime,
+      );
+    }
+
+    if (
+      !fs.existsSync(projectPath) ||
+      !fs.statSync(projectPath).isDirectory()
+    ) {
+      return formatError(
+        command,
+        "project_creation_failed",
+        `WGT import completed but the expected project folder was not created: ${projectPath}`,
+        null,
+        startTime,
+      );
+    }
+
+    const envelope = new Envelope(command);
+    envelope.startTime = startTime;
+    return envelope.success(
+      {
+        wgt_path: normalizedWgtPath,
+        project_path: projectPath,
+        profile: normalizedProfile,
+        platform_version: normalizedVersion,
+        status: "imported",
+      },
+      { warnings: summarizeCreateProjectOutput(output) },
+    );
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to import WGT: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Delete a Tizen project directory on the SDK host.
+ *
+ * Exists because a remote MCP client cannot clean up projects itself: its own
+ * rm -rf targets the client machine, exits 0, and leaves the SDK host
+ * accumulating one directory per create-project run.
+ *
+ * Pure fs operation — this code already runs on the SDK host, so no
+ * platform script is needed. Refuses to delete anything that does not carry a
+ * recognizable Tizen project marker (see isTizenProjectDir).
+ *
+ * @param {string} projectPath - project root directory (absolute path recommended)
+ * @param {string} command - envelope command label
+ * @param {object} [opts]
+ * @param {string} [opts.expectName] - user-confirmed app name; the delete is
+ *   refused when the resolved folder name differs (guards the "wrong sibling
+ *   project" case the marker gate cannot catch)
+ * @param {boolean} [opts.dryRun] - run every safety gate and report what WOULD
+ *   be deleted (result.status = "dry-run") without touching the filesystem
+ * @returns {object} Standard JSON Envelope — result = {project_path, status: "deleted"}
+ */
+async function deleteProject(
+  projectPath,
+  command = "tizen-sdk project-delete",
+  opts = {},
+) {
+  const startTime = Date.now();
+  try {
+    if (!projectPath) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "Missing required parameter: projectPath",
+        'deleteProject("/path/to/MyApp")',
+        startTime,
+      );
+    }
+
+    const normalizedPath = path.resolve(projectPath);
+
+    if (!fs.existsSync(normalizedPath)) {
+      return formatError(
+        command,
+        "io_error",
+        `Project directory does not exist: ${normalizedPath}`,
+        null,
+        startTime,
+      );
+    }
+
+    // Refuse symlinks/junctions outright: rmSync would only unlink the link
+    // (reporting success while the project survives), and a link is also the
+    // vehicle for pointing this command at directories it must never touch.
+    if (fs.lstatSync(normalizedPath).isSymbolicLink()) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Refusing to delete ${normalizedPath}: it is a symbolic link. Pass the real project directory path.`,
+        null,
+        startTime,
+      );
+    }
+
+    // path.resolve() is purely lexical — a symlink in the MIDDLE of the path
+    // would defeat the home/root guards below (the string differs while the
+    // physical target sits inside a protected tree). Guard on the physical
+    // path instead.
+    const realPath = fs.realpathSync.native(normalizedPath);
+
+    // Never operate on a filesystem root, the home directory itself, or any
+    // ancestor of it (C:\Users, /home, ...).
+    if (isProtectedPath(realPath)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Refusing to delete ${realPath}: not a project directory.`,
+        null,
+        startTime,
+      );
+    }
+
+    if (!fs.statSync(realPath).isDirectory()) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Not a directory: ${realPath}`,
+        null,
+        startTime,
+      );
+    }
+
+    // Cross-check against the user-confirmed app name: a mistyped or guessed
+    // path pointing at a DIFFERENT Tizen project would pass the marker gate,
+    // so the folder name itself must match what the user confirmed.
+    const { expectName, dryRun } = opts || {};
+    if (expectName) {
+      const actual = path.basename(realPath);
+      const same =
+        process.platform === "win32"
+          ? actual.toLowerCase() === String(expectName).toLowerCase()
+          : actual === String(expectName);
+      if (!same) {
+        return formatError(
+          command,
+          "invalid_parameters",
+          `Refusing to delete ${realPath}: folder name "${actual}" does not match --expect-name "${expectName}". Confirm the target with the user and retry with the matching path/name.`,
+          null,
+          startTime,
+        );
+      }
+    }
+
+    if (!isTizenProjectDir(realPath)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Refusing to delete ${realPath}: it does not look like a Tizen project (no tizen_*_project.yaml / .tproject / tizen-manifest.xml / project_def.prop marker, no Tizen config.xml or Tizen .csproj, no GBS packaging). Delete it manually if this is really intended.`,
+        null,
+        startTime,
+      );
+    }
+
+    // Dry run: every gate above has passed — report the resolved physical
+    // path that WOULD be deleted, without touching the filesystem, so callers
+    // can show it to the user for confirmation before the real delete.
+    if (dryRun) {
+      const envelope = new Envelope(command);
+      envelope.startTime = startTime;
+      return envelope.success({
+        project_path: realPath,
+        status: "dry-run",
+      });
+    }
+
+    console.error(`[tizen-project] Deleting project: ${realPath}`);
+    fs.rmSync(realPath, { recursive: true, force: true });
+
+    if (fs.existsSync(realPath)) {
+      return formatError(
+        command,
+        "io_error",
+        `Failed to delete ${realPath} — some files could not be removed (locked by a running process?).`,
+        null,
+        startTime,
+      );
+    }
+
+    const envelope = new Envelope(command);
+    envelope.startTime = startTime;
+    return envelope.success({
+      project_path: realPath,
+      status: "deleted",
+    });
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to delete project: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Search for build artifacts (.tpk/.wgt/.rpk/.rpm) in project directory
+ *
+ * @param {string} rootDir - start search directory (project root)
+ * @param {number} newerThan - only files modified after this time (Date.now() value)
+ * @returns {Array<{path: string, format: string, size: number}>}
+ */
+function findBuildArtifacts(rootDir, newerThan) {
+  const artifacts = [];
+  const SKIP_DIRS = new Set(["node_modules", ".git", ".vs", "obj"]);
+  const MAX_DEPTH = 6;
+
+  function walk(dir, depth) {
+    if (depth > MAX_DEPTH) return;
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (_e) {
+      return;
+    }
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!SKIP_DIRS.has(entry.name)) walk(fullPath, depth + 1);
+      } else if (/\.(tpk|wgt|rpk|rpm)$/i.test(entry.name)) {
+        const stat = fs.statSync(fullPath);
+        if (stat.mtimeMs >= newerThan) {
+          artifacts.push({
+            path: fullPath,
+            format: path.extname(fullPath).toLowerCase(),
+            size: stat.size,
+          });
+        }
+      }
+    }
+  }
+
+  walk(rootDir, 0);
+  return artifacts;
+}
+
+/**
+ * Extract only key lines from build script stdout for envelope warnings
+ * (warning/error lines only instead of hundreds-thousands of toolchain output, max 10 lines)
+ */
+function summarizeBuildOutput(output) {
+  return summarizeOutput(output, {
+    keep: /warning|error|fail/i,
+    max: 10,
+    overflowNote: "... (more warning/error lines omitted)",
+  });
+}
+
+/**
+ * Compose a build-failure message that carries the diagnostics inline.
+ *
+ * The skill docs tell agents to surface `errors[0].message`, so the compile
+ * errors have to live in the message itself. A bare log path means the caller
+ * has to go read a file on the host to learn why the build broke — which in
+ * practice led to the cause being guessed at and the build retried unchanged.
+ *
+ * @param {string} headline - first line, e.g. "Build failed (exit 1)."
+ * @param {string[]} diagnostics - output of extractBuildDiagnostics()
+ * @param {string|null} logPath - full log location, if it could be saved
+ */
+function formatBuildFailureMessage(headline, diagnostics, logPath) {
+  const parts = [headline];
+  if (diagnostics.length) {
+    parts.push("", "Build errors:", ...diagnostics.map((line) => `  ${line}`));
+  }
+  parts.push(
+    "",
+    logPath ? `Full log: ${logPath}` : "Full log could not be saved.",
+  );
+  return parts.join("\n");
+}
+
+/**
+ * Save full output of failed build to log file and return path
+ * (REQ-SDK-OUT-003: large logs returned as path reference)
+ */
+function saveBuildLog(output) {
+  try {
+    const logPath = path.join(os.tmpdir(), `tizen-build-${Date.now()}.log`);
+    fs.writeFileSync(logPath, output || "(no output captured)", "utf-8");
+    return logPath;
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * Build Tizen project (tz build + tz pack)
+ *
+ * Synchronously executes build script and verifies artifacts (.tpk/.wgt/.rpk),
+ * returning as Standard JSON Envelope. Large toolchain output is not included in envelope —
+ * on success, only warning/error summary (max 10 lines). On failure the full log is saved
+ * to a file AND the compile diagnostics are returned inline (message + errors[0].details),
+ * so diagnosing a broken build never requires reading a file on the host.
+ *
+ * @param {string} projectPath - project root (absolute path recommended)
+ * @param {string} buildType - Debug (default) | Release | Test
+ * @param {string} [signProfile] - signing profile (optional)
+ * @param {string} [arch] - target architecture for GBS/platform builds: armv7l |
+ *   aarch64 | i586 | x86_64 (default x86_64). Ignored for Native/DotNET/WebApp/RPK
+ *   projects, with a warning when a non-default value was given.
+ * @param {boolean} [clean] - remove previous build output on the SDK host before
+ *   building (forces a full, non-incremental rebuild — compiler warnings reappear)
+ * @returns {object} Standard JSON Envelope — result.artifacts = [{path, format, size_bytes}]
+ */
+async function buildProject(
+  projectPath,
+  buildType = "Debug",
+  signProfile,
+  arch,
+  clean = false,
+  command = "tizen-sdk build-project",
+) {
+  const startTime = Date.now();
+  const VALID_BUILD_TYPES = ["Debug", "Release", "Test"];
+  try {
+    if (!projectPath) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "Missing required parameter: projectPath",
+        'buildProject("/path/to/MyApp", "Debug")',
+        startTime,
+      );
+    }
+
+    // Normalize case (debug → Debug)
+    const normalizedType = VALID_BUILD_TYPES.find(
+      (t) => t.toLowerCase() === String(buildType).toLowerCase(),
+    );
+    if (!normalizedType) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid build type: ${buildType}. Must be one of: ${VALID_BUILD_TYPES.join(", ")}`,
+        null,
+        startTime,
+      );
+    }
+
+    const normalizedProjectPath = path.resolve(projectPath);
+    if (!fs.existsSync(normalizedProjectPath)) {
+      return formatError(
+        command,
+        "io_error",
+        `Project directory does not exist: ${normalizedProjectPath}`,
+        null,
+        startTime,
+      );
+    }
+
+    // The scripts intentionally run `tz build` and then `tz pack`. Compilation
+    // does not need a certificate, but packaging always signs the archive; stop
+    // before either SDK command when the selected (or active) profile cannot be
+    // used because its author/distributor certificate files are unavailable.
+    // Platform projects use GBS and produce RPMs, so they never reach tz pack.
+    //
+    // When no profile is specified and no active profile exists, the preflight
+    // returns usingDefaultCertificates=true — `tz` then uses its built-in default
+    // developer certificates (tempMobile.p12), mirroring the VS Code extension.
+    // Standalone RPK projects are the exception: the scripts package them with
+    // the legacy `tizen package -t rpk`, which has no default-certificate
+    // fallback, so a missing profile is still rejected up front for them.
+    const platformProject = isPlatformProject(normalizedProjectPath);
+    let usingDefaultCertificates = false;
+    if (!platformProject) {
+      const signingPreflight = preflightSigningProfile({
+        profileName: signProfile,
+        allowDefaultCertificates: !isRpkProject(normalizedProjectPath),
+      });
+      if (!signingPreflight.valid) {
+        return formatError(
+          command,
+          "signing_profile_invalid",
+          signingPreflight.error,
+          null,
+          startTime,
+        );
+      }
+      usingDefaultCertificates = Boolean(
+        signingPreflight.usingDefaultCertificates,
+      );
+    }
+
+    // signProfile/arch are interpolated into a shell command line below
+    if (signProfile && !/^[A-Za-z0-9._-]+$/.test(signProfile)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid signing profile name "${signProfile}".`,
+        null,
+        startTime,
+      );
+    }
+    // Only the names gbs knows: a near miss such as "arm" or "arm64" would
+    // otherwise reach `gbs build -A` and fail minutes into the build.
+    if (arch && !GBS_ARCHES.includes(arch)) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid architecture "${arch}". Must be one of: ${GBS_ARCHES.join(", ")} (32-bit ARM → armv7l, 64-bit ARM / arm64 → aarch64, emulator → x86_64).`,
+        null,
+        startTime,
+      );
+    }
+    const gbsArch = arch || DEFAULT_GBS_ARCH;
+
+    // So is the project path itself (-w "<path>").
+    const unsafeProject = checkShellSafe(
+      normalizedProjectPath,
+      "project path",
+      command,
+      startTime,
+    );
+    if (unsafeProject) return unsafeProject;
+
+    const resolved = resolveScript("tizen-build-project");
+    if (resolved.error) {
+      return formatError(command, "io_error", resolved.error, null, startTime);
+    }
+
+    // The build scripts hand the SDK to Tizen CLI (`tizen package -t rpk`),
+    // which parses <sdk>/sdk.info as strict KEY=VALUE lines and crashes on a
+    // comment header or BOM. SDKs installed by older versions of this plugin
+    // have exactly that, so repair the file before the script runs.
+    const sdkInfoNote = describeSdkInfoRepair(repairSdkInfo(readSdkPath()));
+
+    console.error(
+      `[tizen-build] Building ${normalizedProjectPath} (-b ${normalizedType}${clean ? ", clean" : ""})...`,
+    );
+
+    let output;
+    try {
+      const winPath = normalizedProjectPath.replace(/\\/g, "/");
+      const profileArgWin = signProfile ? ` -s "${signProfile}"` : "";
+      const profileArgUnix = signProfile ? ` -s "${signProfile}"` : "";
+      const archArgUnix = ` --arch="${gbsArch}"`;
+      const cleanArgWin = clean ? " -Clean" : "";
+      const cleanArgUnix = clean ? " --clean" : "";
+      output = execPluginScript(
+        resolved.scriptPath,
+        `-w "${winPath}" -b ${normalizedType}${profileArgWin}${cleanArgWin}`,
+        `-w "${normalizedProjectPath}" -b ${normalizedType}${profileArgUnix}${archArgUnix}${cleanArgUnix}`,
+      );
+    } catch (error) {
+      // Failure: the full log still goes to a file, but the envelope has to stand
+      // on its own — the caller should never need to open a host file to find out
+      // which file and line broke the build.
+      const fullOutput = [error.stdout, error.stderr]
+        .filter(Boolean)
+        .join("\n");
+      const logPath = saveBuildLog(fullOutput);
+      const diagnostics = extractBuildDiagnostics(fullOutput);
+      return formatError(
+        command,
+        "build_failed",
+        formatBuildFailureMessage(
+          `Build failed (exit ${error.status || "unknown"}).`,
+          diagnostics,
+          logPath,
+        ),
+        null,
+        startTime,
+        diagnostics,
+      );
+    }
+
+    // Success validation: verify .tpk/.wgt/.rpk artifacts created/updated in this build
+    // For platform (GBS) builds, also check ~/GBS-ROOT for output artifacts
+    let artifacts = findBuildArtifacts(normalizedProjectPath, startTime);
+    if (artifacts.length === 0) {
+      // Check GBS output directory (~/GBS-ROOT) for platform builds
+      const gbsRoot = path.join(os.homedir(), "GBS-ROOT");
+      if (fs.existsSync(gbsRoot)) {
+        artifacts = findBuildArtifacts(gbsRoot, startTime);
+      }
+    }
+    if (artifacts.length === 0) {
+      // Exit code 0 with no package usually means the toolchain reported the real
+      // failure in its own log rather than through the exit status, so surface any
+      // diagnostics here too instead of only pointing at the log file.
+      const logPath = saveBuildLog(output);
+      const diagnostics = extractBuildDiagnostics(output);
+      return formatError(
+        command,
+        "build_failed",
+        formatBuildFailureMessage(
+          `Build script finished but no .tpk/.wgt/.rpk/.rpm artifact was produced under: ${normalizedProjectPath}.`,
+          diagnostics,
+          logPath,
+        ),
+        null,
+        startTime,
+        diagnostics,
+      );
+    }
+
+    const warnings = summarizeBuildOutput(output);
+    if (sdkInfoNote) warnings.push(sdkInfoNote);
+    // Only a non-default value is worth a warning: tizen-cli always passes its
+    // --arch default (x86_64), so an untouched option must stay silent.
+    if (arch && arch !== DEFAULT_GBS_ARCH && !platformProject) {
+      warnings.push(
+        `--arch ${arch} was ignored: it selects the GBS target and applies only to Platform projects (CMakeLists.txt + packaging/*.spec). This project was built with its own toolchain settings.`,
+      );
+    }
+    if (usingDefaultCertificates) {
+      warnings.push(
+        "Signed with Tizen default developer certificates (tempMobile.p12) because no signing profile is set or active. The package installs on the emulator; real Samsung devices and store submission need a custom signing profile — create one with tizen-certificate-manager and rebuild with --sign-profile.",
+      );
+    }
+
+    // RDS: write build-manifest.json after a successful build. Gated on
+    // rdsStateExists() — a project that has never been deployed has nothing
+    // to interop with, and the scan is not free.
+    if (rdsEnabled() && rdsStateExists(normalizedProjectPath)) {
+      try {
+        const appType = detectAppType(normalizedProjectPath); // null for GBS/platform
+        if (appType) {
+          saveBuildManifest(normalizedProjectPath, {
+            projectDir: normalizedProjectPath,
+            timestamp: new Date().toISOString(),
+            hashAlgorithm: "xxh3-128",
+            input: await scanInputFilesAsync(normalizedProjectPath, appType),
+            output: await scanOutputFilesAsync(normalizedProjectPath, appType),
+          });
+        }
+      } catch (err) {
+        // Non-fatal — the build did succeed.
+        console.error("[RDS] Failed to write build-manifest:", err.message);
+      }
+    }
+
+    return formatProjectBuild(artifacts, warnings, startTime);
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to build project: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+/**
+ * Query template list: list available project templates from installed SDK
+ *
+ * Script output format (section header + indented template names), preceded by
+ * machine lines — PROFILE= / PROFILES= always, TV_PROFILE= / TV_WEB= / TV_DOTNET=
+ * only when the Samsung TV SDK extension is installed:
+ *   PROFILE=tizen-11.0
+ *   TV_PROFILE=tv-samsung-10.0
+ *   TV_WEB=Basic_Empty,Basic_Tizen_Blank
+ *   TV_DOTNET=TizenNUIApp
+ *   webapp:
+ *     Basic
+ *     WebService
+ *
+ * @param {string} [type] - project type (native, dotnet, webapp, rpk, tv, platform) — omit for all
+ * @returns {object} Standard JSON Envelope — result.templates = { <type>: [names...] },
+ *   result.profile = tz profile listed under, and result.tv = { profile, web, dotnet }
+ *   when the TV SDK is installed (absent otherwise) — present for typed lists too.
+ */
+async function listTemplates(
+  type,
+  command = "tizen-sdk list-templates",
+  platformVersion = "",
+) {
+  const envelope = new Envelope(command);
+  try {
+    if (type && !VALID_PROJECT_TYPES.includes(type.toLowerCase())) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        `Invalid type: ${type} (use: ${VALID_PROJECT_TYPES.join(", ")})`,
+        null,
+        envelope.startTime,
+      );
+    }
+
+    const resolved = resolveScript("tizen-create-project");
+    if (resolved.error) {
+      return formatError(
+        command,
+        "io_error",
+        resolved.error,
+        null,
+        envelope.startTime,
+      );
+    }
+
+    const versionArgs = platformVersionArgs(
+      platformVersion,
+      command,
+      envelope.startTime,
+    );
+    if (versionArgs.error) return versionArgs.error;
+
+    const winArgs = `-ListTemplates${type ? ` -Type ${type.toLowerCase()}` : ""}${versionArgs.win}`;
+    const unixArgs = `--list-templates${type ? ` --type=${type.toLowerCase()}` : ""}${versionArgs.unix}`;
+    const output = execPluginScript(resolved.scriptPath, winArgs, unixArgs);
+
+    // Debug: log raw script output to stderr for troubleshooting parse failures
+    console.error(`[list-templates] Script output:\n${output}`);
+
+    // Parsing: section headers like "webapp:" + indented lines are template names
+    // Also recognizes "tv:" for Samsung TV templates and "platform:" for GBS-buildable sample apps
+    const templates = {};
+    let currentSection = null;
+    for (const rawLine of output.split("\n")) {
+      const line = rawLine.replace(/\r$/, "");
+      const sectionMatch = line.match(
+        /^(native|dotnet|webapp|rpk|tv|platform):\s*$/,
+      );
+
+      if (sectionMatch) {
+        currentSection = sectionMatch[1];
+        templates[currentSection] = [];
+        continue;
+      }
+      if (currentSection && /^\s+\S/.test(line)) {
+        templates[currentSection].push(line.trim());
+      }
+    }
+
+    // Machine lines the script prints in list mode: the tz profile it listed
+    // under and every profile section `tz list templates` knows about.
+    const profile = ((output.match(/^PROFILE=(.*)$/m) || [])[1] || "").trim();
+    const profiles = ((output.match(/^PROFILES=(.*)$/m) || [])[1] || "")
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    // TV SDK machine lines — printed by the script (typed or untyped list) ONLY
+    // when the Samsung TV SDK extension is installed. The web / dotnet split
+    // lets a plain "webapp" request offer the TV *web* templates alongside the
+    // tizen webapp ones without the agent guessing kinds from template names.
+    const machineList = (key) =>
+      ((output.match(new RegExp(`^${key}=(.*)$`, "m")) || [])[1] || "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const tvProfile = (
+      (output.match(/^TV_PROFILE=(.*)$/m) || [])[1] || ""
+    ).trim();
+    const tv = tvProfile
+      ? {
+          profile: tvProfile,
+          web: machineList("TV_WEB"),
+          dotnet: machineList("TV_DOTNET"),
+        }
+      : null;
+
+    const totalCount = Object.values(templates).reduce(
+      (n, list) => n + list.length,
+      0,
+    );
+    if (!type && totalCount === 0) {
+      return formatError(
+        command,
+        "template_not_found",
+        `No templates found. Is the Tizen SDK installed? Run tizen-sdk-install first.`,
+        null,
+        envelope.startTime,
+      );
+    }
+
+    // A requested type with no templates is a FAILURE, not `{webapp: []}` with
+    // status success (issue #72): the agent read that success as "no templates
+    // exist" and gave up on creating the app. Say what was looked at and why it
+    // may be empty, so the next step is a fix, not a guess.
+    if (type) {
+      const key = type.toLowerCase();
+      if (!templates[key] || templates[key].length === 0) {
+        const where = profile ? ` under profile ${profile}` : "";
+        const known = profiles.length
+          ? ` Profiles known to tz: ${profiles.join(", ")}.`
+          : "";
+        const hints = {
+          dotnet:
+            "The Tizen .NET workload may be missing — run tizen-dotnet-setup, then retry.",
+          tv: "The Samsung TV SDK extension is not installed — run tizen-tv-sdk-install, then retry.",
+          platform:
+            "No GBS platform sample apps ship with this plugin version.",
+        };
+        // An explicit version gets a hint for that version: the generic "run
+        // tizen-tv-sdk-install" installs only the repository's TV version.
+        if (key === "tv" && versionArgs.version) {
+          const sdkPath = readSdkPath();
+          const installed = installedTvVersions(sdkPath, profiles);
+          if (
+            installed.includes(versionArgs.version) ||
+            hasTvExtensionDir(sdkPath, versionArgs.version)
+          ) {
+            // On disk, yet tz lists no TV template (or not even the profile)
+            // for it. Omitting the version helps only when a newer one exists:
+            // the newest-first scan would otherwise pick this version again.
+            const version = versionArgs.version;
+            const others = installed.filter((v) => v !== version);
+            const newer = others.some(
+              (v) => comparePlatformVersions(v, version) > 0,
+            );
+            const alternatives = others.length
+              ? ` To use a complete one, ${newer ? "omit --platform-version or " : ""}pass one of: ${others.join(", ")}.`
+              : "";
+            hints.tv =
+              `The Samsung TV SDK extension is installed for TIZEN-${version}, but tz lists no TV templates for it — the extension may be incomplete. ` +
+              `To reinstall it, ${tvInstallSteps(version, sdkPath)}.` +
+              alternatives;
+          } else {
+            hints.tv = tvVersionMissingMessage(
+              versionArgs.version,
+              installed,
+              sdkPath,
+            );
+          }
+        }
+        const hint =
+          hints[key] ||
+          `The platform package for${where || " that profile"} may be missing or incomplete — run tizen-platform-install (or tizen-update-package), then retry. ` +
+            "Pass --platform-version <X.Y> to list the templates of another installed platform.";
+        return formatError(
+          command,
+          "template_not_found",
+          `No ${key} templates found in the installed SDK${where}.${known} ${hint}`,
+          null,
+          envelope.startTime,
+          rawOutputTail(output),
+        );
+      }
+    }
+
+    return envelope.success({
+      templates,
+      ...(profile ? { profile } : {}),
+      ...(tv ? { tv } : {}),
+    });
+  } catch (error) {
+    // execSync's message is "Command failed: <cmd>" plus stderr only, while the
+    // script's real diagnostics ("Error: tz tool not found at …", "Possible
+    // causes: …") are on stdout. Surface them — an envelope that only echoes
+    // the command line sends the caller off to run `tz list templates` by hand
+    // and invent an answer (issue #41).
+    const scriptOutput = `${error.stdout || ""}\n${error.stderr || ""}`;
+    // Prefer a hard error line; the custom-template sync warning is non-fatal
+    // by design (a read-only SDK dir / Codex sandbox) and used to be picked as
+    // THE diagnosis because it contained the word "failed" (issue #72).
+    const lines = scriptOutput.split(/\r?\n/).map((line) => line.trim());
+    const firstDiag =
+      lines.find((line) => /^(Error:|\[ERROR\])/i.test(line)) ||
+      lines.find(
+        (line) =>
+          /error|not found|failed|cannot/i.test(line) &&
+          !/sync custom template/i.test(line),
+      );
+    const tzMissing = /tz tool not found/i.test(scriptOutput);
+    return formatError(
+      command,
+      "execution_error",
+      `Failed to list templates: ${firstDiag || error.message}`,
+      tzMissing
+        ? "node sdk-init-cli.js <tizen-sdk path>   # or tizen-sdk-install if the SDK is not installed"
+        : null,
+      envelope.startTime,
+      rawOutputTail(scriptOutput),
+    );
+  }
+}
+
+/**
+ * Extract only key lines from app install script stdout for envelope warnings
+ *
+ * Discard banners/section headers/success lines, keep only unique info not in result
+ * (warnings, errors, failure reasons). Exclude "Device Serial:"/"App Package:"/"Found app ID:"
+ * lines as they're redundant with result fields.
+ *
+ * @param {string} output - script stdout+stderr
+ * @returns {string[]} warnings array (key lines only)
+ */
+function summarizeInstallOutput(output) {
+  return summarizeOutput(output, {
+    keep: /warn|error|fail|not found|missing|invalid|storage|exited|crash|disk/i,
+    // APP_RUNNING is the machine channel parsed into app_running — repeating
+    // it here would duplicate the finding into warnings.
+    skip: /^(Device Serial:|App Package:|Found app ID:|APP_RUNNING=|Could not find app)/i,
+    max: 10,
+  });
+}
+
+/**
+ * Parse the tri-state APP_RUNNING marker run_app() emits after a launch.
+ *
+ * The install scripts poll `app_launcher -S` (3 x 1s) and print exactly one
+ * `APP_RUNNING=yes|no|unknown` line; the .ps1 side emits CRLF endings, which
+ * a multiline `$` tolerates (`\r` is a LineTerminator in JS regexes).
+ *
+ * @param {string} output - script stdout+stderr
+ * @returns {boolean|null} true = app verified alive, false = launched but
+ *   vanished (the /opt-full signature), null = not verified (install-only,
+ *   RPM path, -S unusable on this profile, old script).
+ */
+function parseAppRunning(output) {
+  const m = String(output || "").match(/^APP_RUNNING=(yes|no|unknown)$/m);
+  if (!m) return null;
+  return m[1] === "yes" ? true : m[1] === "no" ? false : null;
+}
+
+const PROJECT_ROOT_MARKER_FILES = [
+  "tizen_native_project.yaml",
+  "tizen_dotnet_project.yaml",
+  "tizen_web_project.yaml",
+  "tizen_resource_project.yaml",
+  "tizen-manifest.xml",
+  "project_def.prop",
+  "config.xml",
+];
+
+/**
+ * Cheap, single-level check for "does this directory look like a Tizen
+ * project root at all" — one `readdirSync`, no recursion.
+ *
+ * This exists to gate `detectAppType()`, whose dotnet branch does an
+ * unbounded recursive file search (`findFilesByName`) when no root-level
+ * marker is found. Calling `detectAppType()` directly while walking upward
+ * from a package file would run that recursive search against generic
+ * ancestor directories (`/tmp`, the home directory, ...) — on a real
+ * filesystem that can take effectively forever. Filtering with this first
+ * ensures the expensive call only ever runs against a directory that
+ * already looks like a real (and therefore reasonably small) project.
+ *
+ * @param {string} dir
+ * @returns {boolean}
+ */
+function looksLikeProjectRoot(dir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  return (
+    PROJECT_ROOT_MARKER_FILES.some((f) => entries.includes(f)) ||
+    entries.some((e) => e.endsWith(".csproj"))
+  );
+}
+
+/**
+ * Find the Tizen project root that produced a package, by walking up from
+ * the package's directory until `detectAppType()` recognizes one — this
+ * copes with dotnet's nested `bin/Debug/{tfm}/tpkroot/` output layout, not
+ * just the flat `<projectDir>/Debug/*.tpk` case.
+ *
+ * @param {string} resolvedPath - absolute path to the package file
+ * @returns {string|null} absolute project directory, or null if none of the
+ *   package's ancestors (within a reasonable depth) look like a project
+ */
+function resolveProjectDirFromPackage(resolvedPath) {
+  let dir = path.dirname(resolvedPath);
+  for (let depth = 0; depth < 8; depth++) {
+    if (looksLikeProjectRoot(dir) && detectAppType(dir)) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break; // reached filesystem root
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Resolve the device install-app should target when no serial was given:
+ * `sdb devices`, auto-select when exactly one device is online.
+ *
+ * Returns resolveSerial()'s shape so the caller can map its errorCategory
+ * (device_not_found / multiple_devices / io_error) straight onto the
+ * envelope — the same categories the sibling device commands return — instead
+ * of leaving the ambiguous cases to the install script's exit 1.
+ *
+ * @returns {{serial: string, devices?: Array}|{errorCategory: string, message: string, devices?: Array}}
+ */
+function resolveInstallTargetDevice() {
+  const sdbResolved = resolveSdbBinary();
+  if (sdbResolved.error) {
+    return { errorCategory: "io_error", message: sdbResolved.error };
+  }
+  // viaTempFile: this may be the very first sdb call of the session, which
+  // has to start the sdb server daemon — a plain pipe would then hang
+  // forever (the daemon inherits the pipe write handle; see runSdb()).
+  return resolveSerial(sdbResolved.sdbPath, null, { viaTempFile: true });
+}
+
+/** device_not_found text shared by the pre-check and the script-output fallback. */
+const NO_DEVICE_MESSAGE =
+  "No connected device or emulator. Use tizen-create-emulator to create a VM, then tizen-launch-emulator to launch it, then retry the install with its device_serial.";
+
+/**
+ * How install-app takes an explicit serial, for describeSerialFailure() and
+ * the script-output fallback: the two harnesses spell the option differently.
+ */
+const INSTALL_SERIAL_OPTION =
+  "--serial <serial> in tizen-cli, --device-serial <serial> in the plugin runner";
+
+/**
+ * Turn a non-zero exit of the install script into the right failure envelope.
+ *
+ * Every branch classifies on the script's OUTPUT only. The generic fallback
+ * used to embed `error.message`, which for execSync is
+ * "Command failed: <the full shell command line>" — a line that names the
+ * script path, the package path and the device serial, and diagnoses nothing.
+ * It now reports the exit code and the key output lines instead.
+ *
+ * @param {string} command - envelope command name
+ * @param {string} combined - script stdout + stderr
+ * @param {Error & {status?: number, signal?: string}} error - execSync error
+ * @param {number} startTime
+ * @returns {object} failure envelope
+ */
+function classifyInstallFailure(command, combined, error, startTime) {
+  // exit 1 + "No devices found" = no device signal (script convention)
+  if (/No devices found/i.test(combined)) {
+    return formatError(
+      command,
+      "device_not_found",
+      NO_DEVICE_MESSAGE,
+      null,
+      startTime,
+    );
+  }
+  // The script auto-selects only when exactly one device is online. Normally
+  // the JS pre-check has already answered this; a device that appeared in
+  // between still has to come back as multiple_devices, not io_error.
+  if (/Multiple devices found/i.test(combined)) {
+    const listed = [];
+    const listRe = /^\s*\d+\.\s+(\S+)\s*$/gm;
+    let m;
+    while ((m = listRe.exec(combined)) !== null) listed.push(m[1]);
+    return formatError(
+      command,
+      "multiple_devices",
+      `Multiple devices connected${listed.length ? ` (${listed.join(", ")})` : ""}. Pick one and re-run with ${INSTALL_SERIAL_OPTION}.`,
+      null,
+      startTime,
+    );
+  }
+  // Certificate/signing errors — the device does not trust the certificate
+  // the package was signed with. Since builds without a profile are signed
+  // with the SDK's default developer certificates (emulator-only), this is
+  // most often a default-signed package pushed to a real device, or a
+  // profile whose distributor certificate does not match the device.
+  if (
+    /Invalid certificate chain|Check certificate error|certificate.*signature/i.test(
+      combined,
+    )
+  ) {
+    const detail = summarizeInstallOutput(combined).join(" | ");
+    return formatError(
+      command,
+      "certificate_error",
+      `App installation failed due to a certificate/signing error${detail ? ` — ${detail}` : ""}. The device does not trust the package's signing certificate — typically the package was signed with the SDK default developer certificates (no signing profile), which only the emulator accepts, or the profile's distributor certificate does not cover this device. Use tizen-certificate-manager to create a signing profile for this device (Samsung certificate for Samsung devices), then rebuild with tizen-build-project passing the profile name, and retry install.`,
+      null,
+      startTime,
+    );
+  }
+  // Package ID too short — Tizen requires exactly 10 alphanumeric characters.
+  // Shorter IDs cause "Load archive info fail" / "Operation not allowed [-4]".
+  if (/Load archive info fail|Operation not allowed \[-4\]/i.test(combined)) {
+    return formatError(
+      command,
+      "invalid_package_id",
+      'App installation failed with "Load archive info fail" / "Operation not allowed [-4]". ' +
+        "This typically means the package ID is shorter than 10 characters. " +
+        "Tizen requires exactly 10 alphanumeric characters for the package ID. " +
+        'Recreate the project with an app name containing at least 10 alphanumeric characters (e.g., "MyTizenApp01"), then rebuild and retry install.',
+      null,
+      startTime,
+    );
+  }
+  // RPK registration conflict — error -21. The device package-manager's
+  // package_res_info table has PRIMARY KEY(res_type, res_version). The SDK
+  // template hardcodes res-type="tizen.sample.resource" and res-version="1.5.0"
+  // for all RPK projects, so a second RPK with the same values collides.
+  // This is now fixed at project creation time (patchRpkManifestResType),
+  // but older projects created before the fix may still hit this.
+  if (
+    /Register application error \[-21\]|key\[error\] val\[-21\]/i.test(combined)
+  ) {
+    return formatError(
+      command,
+      "rpk_res_type_conflict",
+      "RPK installation failed with error -21 (Register application error). " +
+        "The device package-manager rejected the package because another RPK with the same res-type/res-version is already installed. " +
+        'The SDK template hardcodes res-type="tizen.sample.resource" and res-version="1.5.0" for all RPK projects, ' +
+        "and the device's package_res_info table has PRIMARY KEY(res_type, res_version). " +
+        "Fix: uninstall the conflicting RPK (sdb shell pkgcmd -u -n <pkgid>), or recreate this project with the tizen-create-project skill " +
+        "(which now patches res-type to the package ID, making each RPK unique), then rebuild and retry install.",
+      null,
+      startTime,
+    );
+  }
+
+  const detail = summarizeInstallOutput(combined).join(" | ");
+  // Timeout = code ETIMEDOUT (status null, SIGTERM), not `killed`.
+  const exitInfo = describeChildExit(error, "install script").text;
+  return formatError(
+    command,
+    "io_error",
+    `App installation failed (${exitInfo})${detail ? `: ${detail}` : ". The script printed no diagnostic line."}`,
+    null,
+    startTime,
+  );
+}
+
+/**
+ * Whether the package sits inside the build-output tree RDS tracks.
+ *
+ * The RDS scanners are hard-wired to the Debug output (`Debug/tpk_contents`,
+ * `Debug/projects/<name>/`, `bin/Debug/<tfm>/tpkroot/` — see
+ * rds/constants.js), so a baseline only describes what a *Debug* package
+ * contains. Installing anything else from the same project (a Release or
+ * Test build, an old copy kept elsewhere) must bypass RDS entirely:
+ * otherwise reconcile would compare the untouched Debug tree against the
+ * baseline, find no drift, and "fast-deploy" without installing the package
+ * the user actually asked for.
+ *
+ * @param {string} projectDir
+ * @param {string} resolvedPath - absolute path to the package file
+ * @returns {boolean}
+ */
+function isRdsTrackedPackage(projectDir, resolvedPath) {
+  const rel = path.relative(projectDir, resolvedPath);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) return false;
+  const segments = rel.split(path.sep);
+  // Package file itself is the last segment; "Debug" must be a directory
+  // somewhere above it (native/web: `Debug/App.tpk`, dotnet:
+  // `<csprojDir>/bin/Debug/<tfm>/App.tpk`).
+  return segments.slice(0, -1).includes("Debug");
+}
+
+/**
+ * Whether RDS has any business with this project/package at all —
+ * permanently ineligible cases (platform/GBS, RPM/RPK, a package outside the
+ * Debug output tree, unrecognized app type) are excluded here rather than
+ * repeated at each call site.
+ *
+ * Deliberately does NOT check `rdsStateExists()` — callers that require an
+ * existing baseline (the delta-deploy attempt) append that check
+ * themselves; `updateRdsState()` is what creates that state in the first
+ * place, so baking the check in here would make it impossible to ever
+ * bootstrap.
+ *
+ * @param {string} projectDir
+ * @param {string} resolvedPath - absolute path to the package file
+ * @returns {boolean}
+ */
+function rdsEligible(projectDir, resolvedPath) {
+  if (!projectDir) return false;
+  return (
+    rdsEnabled() &&
+    !isPlatformProject(projectDir) &&
+    !/\.(rpm|rpk)$/i.test(resolvedPath) &&
+    isRdsTrackedPackage(projectDir, resolvedPath) &&
+    Boolean(detectAppType(projectDir))
+  );
+}
+
+/** Success envelope for install-app, stamped with the call's start time. */
+function installSuccess(command, startTime, result, options) {
+  const envelope = new Envelope(command);
+  envelope.startTime = startTime;
+  return envelope.success(result, options);
+}
+
+/**
+ * installApp's --reset-rds mode: clear host-side RDS state for the package's
+ * project and return without installing.
+ *
+ * RDS recovery is deliberately handled before normal package validation:
+ * the package may have been removed or become stale while the project's
+ * host-side .tizen-rds state is still corrupt. The package path is used
+ * only to locate the Tizen project root; no device or install script is
+ * touched in reset mode.
+ *
+ * @returns {object} Standard JSON Envelope
+ */
+function resetRdsForPackage(command, resolvedPath, runAfterInstall, startTime) {
+  if (runAfterInstall) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      "--reset-rds cannot be combined with --run; reset clears host-side RDS state without installing the package.",
+      null,
+      startTime,
+    );
+  }
+  if (!/\.(tpk|wgt|rpk|rpm)$/i.test(resolvedPath)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid app package path: ${resolvedPath}. Use the path to a .tpk, .wgt, .rpk, or .rpm package so its project can be located.`,
+      null,
+      startTime,
+    );
+  }
+
+  const resetProjectDir = resolveProjectDirFromPackage(resolvedPath);
+  if (!resetProjectDir) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Could not locate a Tizen project for package path: ${resolvedPath}. Pass a package path inside the project build output directory.`,
+      null,
+      startTime,
+    );
+  }
+
+  if (!resetAllRdsState(resetProjectDir)) {
+    return formatError(
+      command,
+      "io_error",
+      `Could not remove RDS state at ${path.join(resetProjectDir, ".tizen-rds")} — a file may be locked by another process. Close editors or tools holding it open and retry.`,
+      null,
+      startTime,
+    );
+  }
+  return installSuccess(command, startTime, {
+    project_path: resetProjectDir,
+    rds_state: "reset",
+  });
+}
+
+/**
+ * Host-side checks on the install request (package file, --run/RPK combo,
+ * serial and path shell safety) — nothing here touches a device.
+ *
+ * @returns {object|null} failure envelope, or null when the request is valid
+ */
+function validateInstallRequest(
+  command,
+  resolvedPath,
+  deviceSerial,
+  runAfterInstall,
+  startTime,
+) {
+  if (!fs.existsSync(resolvedPath)) {
+    return formatError(
+      command,
+      "io_error",
+      `App package not found: ${resolvedPath}`,
+      null,
+      startTime,
+    );
+  }
+  if (!/\.(tpk|wgt|rpk|rpm)$/i.test(resolvedPath)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid app package: ${resolvedPath}. Must be a .tpk, .wgt, .rpk, or .rpm file.`,
+      null,
+      startTime,
+    );
+  }
+  if (/\.rpk$/i.test(resolvedPath) && runAfterInstall) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      "RPK resource packages cannot be launched. Install the package without --run so the resource package chain can refresh its associated applications.",
+      null,
+      startTime,
+    );
+  }
+
+  // Allow only safe characters in shell args
+  if (deviceSerial && !/^[A-Za-z0-9._:-]+$/.test(deviceSerial)) {
+    return formatError(
+      command,
+      "invalid_parameters",
+      `Invalid device serial: ${deviceSerial}`,
+      null,
+      startTime,
+    );
+  }
+
+  // The package path is spliced into -PackagePath "<path>" / -p "<path>".
+  return (
+    checkShellSafe(resolvedPath, "package path", command, startTime) || null
+  );
+}
+
+/**
+ * Resolve the target device once, in JS, before anything runs: an explicit
+ * serial is taken as is; otherwise exactly one online device must be
+ * connected. "No device" and "more than one device" are decided HERE, with
+ * the same categories every sibling command (screenshot, file-transfer,
+ * sdb-helper) returns — device_not_found (DEVICE_E001) and
+ * multiple_devices (DEVICE_E002). Before, the install script exited 1 with
+ * "Multiple devices found" and the caller filed that under io_error
+ * (IO_E001) with the full shell command line in the message.
+ *
+ * The serial is also what the RDS attempt and the install script
+ * (via -s/-DeviceSerial) both target, so they cannot disagree.
+ *
+ * @returns {{serial: string|null}|{failure: object}}
+ */
+function resolveInstallSerial(command, deviceSerial, startTime) {
+  if (deviceSerial) return { serial: deviceSerial };
+  const deviceResolution = resolveInstallTargetDevice();
+  if (
+    deviceResolution.errorCategory === "device_not_found" ||
+    deviceResolution.errorCategory === "multiple_devices"
+  ) {
+    const failure = describeSerialFailure(deviceResolution, {
+      serialOption: INSTALL_SERIAL_OPTION,
+    });
+    return {
+      failure: formatError(
+        command,
+        failure.category,
+        // install-app's own no-device text names the retry (device_serial).
+        failure.category === "device_not_found"
+          ? NO_DEVICE_MESSAGE
+          : failure.message,
+        failure.suggestedFix,
+        startTime,
+        failure.detailLines,
+      ),
+    };
+  }
+  // io_error (sdb itself failed) or no sdb binary: fall through and let the
+  // install script report the SDK/tool problem it will hit first.
+  return { serial: deviceResolution.serial || null };
+}
+
+/**
+ * Try an RDS delta / fast-deploy instead of a full install.
+ *
+ * @returns {Promise<object|null>} tryRdsDeploy()'s result, or null when RDS
+ *   does not apply or the attempt threw (non-fatal — the caller falls through
+ *   to the full install)
+ */
+async function attemptRdsDeploy(
+  projectDir,
+  resolvedSerial,
+  resolvedPath,
+  runAfterInstall,
+) {
+  if (
+    !resolvedSerial ||
+    !rdsEligible(projectDir, resolvedPath) ||
+    !rdsStateExists(projectDir) // a delta needs a prior baseline to diff against
+  ) {
+    return null;
+  }
+  try {
+    // With an explicit --device-serial the `sdb devices` call was
+    // skipped, so the RDS primitives' execFile-based sdb calls may be the
+    // first of the session — a cold daemon would hang them (see
+    // ensureSdbServer). Cheap no-op when the server is already up.
+    const sdbResolved = resolveSdbBinary();
+    if (!sdbResolved.error) ensureSdbServer(sdbResolved.sdbPath);
+
+    return await tryRdsDeploy(projectDir, resolvedSerial, runAfterInstall);
+  } catch (err) {
+    // Non-fatal — falls through to the full install.
+    console.error("[RDS] deploy attempt failed:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Success envelope for a package deployed through RDS (delta or fast-deploy).
+ *
+ * @returns {object} Standard JSON Envelope
+ */
+function rdsDeploySuccess(command, startTime, ctx, rdsResult) {
+  const { projectDir, resolvedPath, resolvedSerial, runAfterInstall } = ctx;
+  // Same meaning as the full-install path's app_id (the launchable ID
+  // from `app_launcher -l`): web `<tizen:application id>`, native/dotnet
+  // `<ui-application appid>` — NOT the package ID.
+  const appType = detectAppType(projectDir);
+  const appId =
+    (appType === "web"
+      ? parseWebAppId(projectDir)
+      : parseManifestAppId(projectDir)) ?? null;
+
+  return installSuccess(
+    command,
+    startTime,
+    {
+      package_path: resolvedPath,
+      device_serial: resolvedSerial,
+      app_id: appId,
+      installation_status: "completed",
+      app_launched: Boolean(runAfterInstall),
+      app_running: null, // no app_launcher -S check on this path
+      deploy_type: rdsResult.type, // "rds" | "fast-deploy"
+      ...(rdsResult.rdsTimings ? { rds_timings: rdsResult.rdsTimings } : {}),
+    },
+    { warnings: [] },
+  );
+}
+
+/**
+ * Run scripts/tizen-install-app and check its output for the success marker.
+ *
+ * @returns {{output: string}|{failure: object}}
+ */
+function runInstallScript(command, startTime, ctx) {
+  const { resolvedPath, resolvedSerial, runAfterInstall } = ctx;
+  const resolved = resolveScript("tizen-install-app");
+  if (resolved.error) {
+    return {
+      failure: formatError(
+        command,
+        "io_error",
+        resolved.error,
+        null,
+        startTime,
+      ),
+    };
+  }
+
+  console.error(
+    `[tizen-install] Installing ${resolvedPath}${resolvedSerial ? ` on ${resolvedSerial}` : ""}`,
+  );
+
+  // Pass forward slash paths to Windows script (Node.js compatible)
+  const winPath = resolvedPath.replace(/\\/g, "/");
+  const serialArg = (flag) =>
+    resolvedSerial ? ` ${flag} "${resolvedSerial}"` : "";
+  const runArg = (flag) => (runAfterInstall ? ` ${flag}` : "");
+  const winArgs =
+    `-PackagePath "${winPath}"` +
+    serialArg("-DeviceSerial") +
+    runArg("-RunAfterInstall");
+  const unixArgs = `-p "${resolvedPath}"` + serialArg("-s") + runArg("-r");
+
+  let output;
+  try {
+    // captureViaTempFile required: if script's sdb call starts new sdb server daemon,
+    // daemon inherits stdout pipe and execSync blocks forever.
+    output = execPluginScript(resolved.scriptPath, winArgs, unixArgs, {
+      captureViaTempFile: true,
+    });
+  } catch (error) {
+    const combined = `${error.stdout || ""}\n${error.stderr || ""}`;
+    return {
+      failure: classifyInstallFailure(command, combined, error, startTime),
+    };
+  }
+
+  // The script prints this marker only on the exit-0 path — if it is missing
+  // (or an install error line is present) treat the run as failed even when
+  // the process exit code was 0, so a script bug can't report a false success.
+  if (
+    !/Installation completed successfully/i.test(output) ||
+    /failed to install the package|\[ERROR\] Installation failed/i.test(output)
+  ) {
+    const detail = summarizeInstallOutput(output).join(" | ");
+    return {
+      failure: formatError(
+        command,
+        "io_error",
+        `App installation failed${detail ? `: ${detail}` : ""}`,
+        null,
+        startTime,
+      ),
+    };
+  }
+  return { output };
+}
+
+/**
+ * RDS: record a full install as the new baseline for the device, so a
+ * future install-app can fast-deploy/RDS-delta against it.
+ *
+ * @returns {Promise<object|null>} rds_timings, or null when not recorded
+ */
+async function recordRdsBaseline(projectDir, installedSerial, resolvedPath) {
+  if (!installedSerial || !rdsEligible(projectDir, resolvedPath)) return null;
+  const rdsResult = await updateRdsState(
+    projectDir,
+    installedSerial,
+    "full",
+  ).catch(() => {});
+  return rdsResult && rdsResult.rdsTimings ? rdsResult.rdsTimings : null;
+}
+
+/**
+ * Success envelope for a full script install, parsed from the script output.
+ *
+ * @returns {Promise<object>} Standard JSON Envelope
+ */
+async function fullInstallSuccess(command, startTime, ctx, output) {
+  const { projectDir, resolvedPath, resolvedSerial } = ctx;
+  // Success marker parsing (script must output on success)
+  const serialMatch = output.match(/^Device Serial:\s*(.+)$/m);
+  const appIdMatch = output.match(/^Found app ID:\s*(.+)$/m);
+  const launched = /App launched successfully/i.test(output);
+
+  // app_launched only proves launchpad accepted the launch; APP_RUNNING is
+  // the script's post-launch verdict — app_launcher -S for tpk/wgt, a pgrep
+  // poll of /usr/bin/<name> for rpm platform apps. true/false when the check
+  // gave a clear answer, null when it could not be verified (install-only,
+  // -S unusable on this profile, old script).
+  const appRunning = parseAppRunning(output);
+
+  const warnings = summarizeInstallOutput(output);
+  // The /opt crash-dump advice is for app_launcher-managed apps; for rpm the
+  // script already surfaces /tmp/<name>.log lines plus a display/library hint.
+  if (appRunning === false && !/\.rpm$/i.test(resolvedPath)) {
+    warnings.unshift(
+      "App launched but exited immediately — check /opt disk space (sdb shell df -h /opt) and crash dumps at /opt/usr/share/crash/dump (cleanup requires 'sdb root on'; see the tizen-sdb-helper skill).",
+    );
+  }
+
+  // Uses the serial the script actually reported, not the possibly-unresolved
+  // parameter/pre-resolved value.
+  const installedSerial = serialMatch
+    ? serialMatch[1].trim()
+    : resolvedSerial || null;
+  const rdsTimings = await recordRdsBaseline(
+    projectDir,
+    installedSerial,
+    resolvedPath,
+  );
+
+  return installSuccess(
+    command,
+    startTime,
+    {
+      package_path: resolvedPath,
+      device_serial: installedSerial,
+      app_id: appIdMatch ? appIdMatch[1].trim() : null,
+      installation_status: "completed",
+      app_launched: launched,
+      app_running: appRunning,
+      deploy_type: "full",
+      ...(rdsTimings ? { rds_timings: rdsTimings } : {}),
+    },
+    {
+      // Key lines only (warnings/errors) instead of full installation log
+      warnings,
+    },
+  );
+}
+
+/**
+ * Install Tizen app package (.tpk/.wgt/.rpk/.rpm) on connected device/emulator
+ *
+ * Executes scripts/tizen-install-app: verify package → install with
+ * tz install (for .tpk/.wgt), direct `sdb install` (for .rpk — tz install
+ * accepts only tpk/wgt, and sdb's protocol result is inspected because its
+ * exit code can be 0 on a device-side rejection), or sdb push + `rpm -ivh`
+ * after `sdb root on` (for .rpm) → verify installation →
+ * (optional) run with app_launcher (.tpk/.wgt) or as user `owner` via a
+ * launcher script under /home/owner (.rpm; platform apps are not registered
+ * with app_launcher). RPK is never launched.
+ * If no connected device, script signals exit 1 and returns device_not_found
+ * envelope — caller creates+launches an emulator via tizen-create-emulator and
+ * tizen-launch-emulator, then retries.
+ *
+ * @param {string} packagePath - .tpk/.wgt/.rpk/.rpm absolute path (relative paths are resolved)
+ * @param {string} [deviceSerial] - target device serial (omit to auto-select single connected)
+ * @param {boolean} [runAfterInstall=false] - whether to run app after installation
+ * @param {boolean} [resetRds=false] - clear host-side RDS state for the package's project and return without installing
+ * @returns {object} Standard JSON Envelope
+ */
+async function installApp(
+  packagePath,
+  deviceSerial,
+  runAfterInstall = false,
+  command = "tizen-sdk install-app",
+  resetRds = false,
+) {
+  const startTime = Date.now();
+  try {
+    if (!packagePath) {
+      return formatError(
+        command,
+        "invalid_parameters",
+        "Missing required parameter: packagePath (.tpk, .wgt, .rpk, or .rpm)",
+        'installApp("/absolute/path/MyApp-1.0.0.tpk")',
+        startTime,
+      );
+    }
+
+    const resolvedPath = path.resolve(packagePath);
+
+    if (resetRds) {
+      return resetRdsForPackage(
+        command,
+        resolvedPath,
+        runAfterInstall,
+        startTime,
+      );
+    }
+
+    const invalid = validateInstallRequest(
+      command,
+      resolvedPath,
+      deviceSerial,
+      runAfterInstall,
+      startTime,
+    );
+    if (invalid) return invalid;
+
+    const target = resolveInstallSerial(command, deviceSerial, startTime);
+    if (target.failure) return target.failure;
+    const resolvedSerial = target.serial;
+
+    // RDS: the project dir is only needed for the RDS attempt below. Gated
+    // behind rdsEnabled() so the kill switch disables the RDS path entirely.
+    const projectDir = rdsEnabled()
+      ? resolveProjectDirFromPackage(resolvedPath)
+      : null;
+    const ctx = { projectDir, resolvedPath, resolvedSerial, runAfterInstall };
+
+    const rdsResult = await attemptRdsDeploy(
+      projectDir,
+      resolvedSerial,
+      resolvedPath,
+      runAfterInstall,
+    );
+    if (rdsResult && rdsResult.deployed) {
+      return rdsDeploySuccess(command, startTime, ctx, rdsResult);
+    }
+
+    const install = runInstallScript(command, startTime, ctx);
+    if (install.failure) return install.failure;
+
+    return await fullInstallSuccess(command, startTime, ctx, install.output);
+  } catch (error) {
+    return formatError(
+      command,
+      "io_error",
+      `Failed to install app: ${error.message}`,
+      null,
+      startTime,
+    );
+  }
+}
+
+module.exports = {
+  VALID_PROJECT_TYPES,
+  classifyInstallFailure,
+  validatePackageId,
+  isPlatformProject,
+  createProject,
+  importWgt,
+  deleteProject,
+  buildProject,
+  listTemplates,
+  installApp,
+  buildImportWgtScriptArgs,
+  // Exported for tests — the safety gate for deleteProject / createProject --force.
+  isTizenProjectDir,
+  // Exported for tests — the APP_RUNNING contract with the install scripts.
+  parseAppRunning,
+  // Exported for tests — the RPK res-type uniqueness patch.
+  patchRpkManifestResType,
+  // Exported for tests — the RDS "is this package the Debug output" gate.
+  isRdsTrackedPackage,
+  // Exported for tests — the --platform-version / default-platform hand-off.
+  platformVersionArgs,
+};

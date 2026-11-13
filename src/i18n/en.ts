@@ -43,7 +43,7 @@ export const en = {
   setupFoundSdk: "Found an existing installation",
   setupUse: "Use this",
   setupChoose: "Choose folder…",
-  setupDiskNote: "A fresh Samsung SDK install needs about {gb} GB of free space. Automatic installation is not available in this version yet.",
+  setupDiskNote: "A first-time Samsung SDK installation needs about {gb} GB of free disk space. Existing installations can be reused.",
   setupInvalid: "That folder doesn't look like a Tizen SDK (tools/sdb was not found).",
   setupNodeMissing: "The built-in Node.js runtime is missing from this build.",
   setupCliMissing: "The bundled Samsung tools are missing from this build.",
@@ -94,7 +94,7 @@ export const en = {
 
   // install
   installButton: "Install on TV",
-  installSoon: "Installing apps arrives in the next update. Signing and installation are not available in this version.",
+  installSoon: "TV Deploy signs a temporary copy of your selected WGT and leaves the original file unchanged.",
   installNeedTv: "Connect a TV first",
   installNeedApp: "Choose an app first",
 
@@ -143,6 +143,35 @@ export const en = {
   timeout: "Connection timeout (ms)",
   settingsSaved: "Saved",
   invalidSetting: "Check the values: port 1–65535, timeout 100–30000 ms.",
+
+  "setupAutoInstall": "Install Samsung tools automatically",
+  "setupInstallExtension": "Install Samsung TV Extension",
+  "setupInstalling": "Installing official Samsung tools. Keep TV Deploy open; this may take a while…",
+  "setupAutoBody": "TV Deploy downloads the official Tizen SDK and Samsung TV Extension. The graphical Tizen Studio IDE is not installed.",
+  "certNeedDuid": "Reconnect to the TV to read its DUID before creating a Samsung certificate.",
+  "certPasswordMismatch": "The certificate passwords do not match.",
+  "certInvalidProfile": "Use 3–64 letters, numbers, hyphens or underscores for the profile name.",
+  "certTitle": "Samsung certificate",
+  "certSubtitle": "A certificate is issued by Samsung and linked to this TV.",
+  "certReady": "Ready",
+  "certSelect": "Signing profile for this TV",
+  "certCreateAnother": "Create another certificate",
+  "certForTv": "The distributor certificate will be linked to {ip}.",
+  "certProfileName": "Profile name",
+  "certIdentity": "Author name",
+  "certLocalPassword": "Certificate password",
+  "certConfirmPassword": "Confirm password",
+  "certPasswordHint": "This is a local certificate password, not your Samsung Account password. At least 8 characters with uppercase, lowercase and a number. Samsung sign-in opens in your browser.",
+  "certCreate": "Create Samsung certificate",
+  "certStartLogin": "Creating the certificate. Complete Samsung Account sign-in in the browser if requested…",
+  "certSuccess": "Samsung certificate and signing profile created for this TV.",
+  "certCreateError": "Could not create the Samsung certificate.",
+  "certProfile": "Signing profile",
+  "installSignNotice": "TV Deploy creates a signed copy of the selected WGT using your profile. The original file on your computer is never changed.",
+  "installRunAfter": "Launch the app after installation",
+  "installWorking": "Signing the selected app and installing it on the TV…",
+  "installSuccess": "{name} was installed on your TV.",
+  "installFailure": "Could not install the application."
 } as const;
 
 export type Key = keyof typeof en;

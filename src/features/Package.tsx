@@ -11,7 +11,7 @@ import type { PackageReport, SignatureState } from "../types";
 
 const SIG_TONE: Record<SignatureState, "ok" | "warn" | "err"> = { signed_structure: "ok", unsigned: "warn", partial: "warn", malformed: "err" };
 
-export function PackagePanel({ report, onReport }: { report: PackageReport | null; onReport: (r: PackageReport | null) => void }) {
+export function PackagePanel({ report, onReport }: { report: PackageReport | null; onReport: (r: PackageReport | null, path: string | null) => void }) {
   const { t, lang } = useI18n();
   const [hover, setHover] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -21,10 +21,10 @@ export function PackagePanel({ report, onReport }: { report: PackageReport | nul
     setBusy(true);
     setError(null);
     try {
-      onReport(await api.analyzePackage(path));
+      onReport(await api.analyzePackage(path), path);
     } catch (e) {
       const code = `err_${toApiError(e).code}`;
-      onReport(null);
+      onReport(null, null);
       setError(hasKey(code) ? code : "err_internal");
     } finally {
       setBusy(false);
@@ -68,7 +68,7 @@ export function PackagePanel({ report, onReport }: { report: PackageReport | nul
             <p className="m-0 truncate font-semibold">{report.app_name ?? report.file_name}</p>
             <p className="selectable m-0 truncate text-xs text-[var(--muted)]">{report.file_name}</p>
           </div>
-          <Button variant="ghost" onClick={() => onReport(null)}><X size={15} aria-hidden />{t("pkgClear")}</Button>
+          <Button variant="ghost" onClick={() => onReport(null, null)}><X size={15} aria-hidden />{t("pkgClear")}</Button>
         </div>
         <dl className="m-0 mt-3">
           {report.app_name && <Row label={t("pkgName")}>{report.app_name}</Row>}

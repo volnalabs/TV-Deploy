@@ -92,6 +92,20 @@ fn drain<R: Read + Send + 'static>(mut r: R) -> thread::JoinHandle<String> {
 }
 
 pub fn run(tc: &Toolchain, inv: &Invocation, opts: &RunOptions) -> Result<RunOutput, RunError> {
+    run_with_env(tc, inv, opts, &[])
+}
+
+/// Run a typed Samsung CLI invocation with a small, caller-supplied environment overlay.
+///
+/// This is used for Samsung's documented hidden-password prompt: the UI enters the
+/// certificate password, Rust passes it as TIZEN_CERTIFICATE_PASSWORD to the child
+/// environment, and the password never appears in argv, logs, or persisted settings.
+pub fn run_with_env(
+    tc: &Toolchain,
+    inv: &Invocation,
+    opts: &RunOptions,
+    environment: &[(String, String)],
+) -> Result<RunOutput, RunError> {
     let script = tc.cli_dir.join(inv.script.file_name());
     if !script.is_file() {
         return Err(RunError::ScriptMissing);
@@ -109,6 +123,9 @@ pub fn run(tc: &Toolchain, inv: &Invocation, opts: &RunOptions) -> Result<RunOut
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in environment {
+        cmd.env(key, value);
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
