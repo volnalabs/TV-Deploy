@@ -1,0 +1,12 @@
+[tizen-sdk] Using default SDK path: <HOME>/tizen-sdk
+{
+  "command": "tizen-sdk certificate-manager acquire-duid",
+  "user_command": "node cert-manager-cli.js acquire-duid",
+  "status": "error",
+  "errors": [
+    {
+      "code": "execution_error",
+      "message": "sdb not available: sdb not found at <HOME>/tizen-sdk/tools/sdb and not on PATH. Run tizen-sdk-init with the correct SDK path."
+    }
+  ]
+}

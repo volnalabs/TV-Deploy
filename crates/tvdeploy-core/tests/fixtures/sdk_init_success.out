@@ -1,0 +1,12 @@
+{
+  "status": "success",
+  "result": {
+    "sdk_path": "<SDK>",
+    "config_file": "<HOME>/.tizen.sdk.path.config"
+  },
+  "warnings": [],
+  "errors": [],
+  "command": "tizen-sdk sdk-init",
+  "user_command": "node sdk-init-cli.js <SDK>",
+  "duration_ms": 0
+}
