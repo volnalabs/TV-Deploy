@@ -43,7 +43,7 @@ export const en = {
   setupFoundSdk: "Found an existing installation",
   setupUse: "Use this",
   setupChoose: "Choose folder…",
-  setupDiskNote: "A fresh Samsung SDK install needs about {gb} GB of free space. Automatic installation is not available in this version yet.",
+  setupDiskNote: "A first-time Samsung SDK installation needs about {gb} GB of free disk space. Existing installations can be reused.",
   setupInvalid: "That folder doesn't look like a Tizen SDK (tools/sdb was not found).",
   setupNodeMissing: "The built-in Node.js runtime is missing from this build.",
   setupCliMissing: "The bundled Samsung tools are missing from this build.",
