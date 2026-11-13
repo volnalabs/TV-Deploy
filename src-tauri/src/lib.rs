@@ -4,6 +4,7 @@
 mod api;
 mod settings;
 mod toolchain;
+mod sdk_installer;
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -34,6 +35,10 @@ pub fn run() {
             api::toolchain_status,
             api::find_existing_sdk,
             api::set_sdk_path,
+            api::install_samsung_sdk,
+            api::create_samsung_certificate,
+            api::remove_samsung_certificate_profile,
+            api::install_package,
             api::scan_tvs,
             api::connect_tv,
             api::disconnect_tv,
