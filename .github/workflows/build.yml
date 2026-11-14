@@ -122,18 +122,20 @@ jobs:
       - name: Collect installers under their published names
         run: |
           mkdir -p out
-          shopt -s globstar nullglob
-          one() { # exactly one file must match the glob
-            if [ "$#" -ne 1 ]; then echo "expected exactly one file, got $#: $*" >&2; exit 1; fi
-            echo "$1"
+          # `find` rather than `**`: macOS runners ship bash 3.2, which has no globstar.
+          collect() { # collect <bundle dir> <extension> <published name>; exactly one match
+            found="$(find target -path "*/release/bundle/$1/*.$2" -type f)"
+            count="$(printf '%s' "$found" | grep -c . || true)"
+            if [ "$count" -ne 1 ]; then echo "expected exactly one $1/*.$2, got $count: $found" >&2; exit 1; fi
+            cp "$found" "out/$3"
           }
           case "${{ matrix.name }}" in
-            Windows-x64) cp "$(one target/**/release/bundle/nsis/*.exe)" out/EasyTizen-Windows-x64-Setup.exe ;;
-            macOS-ARM64) cp "$(one target/**/release/bundle/dmg/*.dmg)" out/EasyTizen-macOS-ARM64.dmg ;;
-            macOS-Intel) cp "$(one target/**/release/bundle/dmg/*.dmg)" out/EasyTizen-macOS-Intel.dmg ;;
+            Windows-x64) collect nsis exe EasyTizen-Windows-x64-Setup.exe ;;
+            macOS-ARM64) collect dmg dmg EasyTizen-macOS-ARM64.dmg ;;
+            macOS-Intel) collect dmg dmg EasyTizen-macOS-Intel.dmg ;;
             Linux-x64)
-              cp "$(one target/**/release/bundle/appimage/*.AppImage)" out/EasyTizen-Linux-x64.AppImage
-              cp "$(one target/**/release/bundle/deb/*.deb)" out/EasyTizen-Linux-x64.deb ;;
+              collect appimage AppImage EasyTizen-Linux-x64.AppImage
+              collect deb deb EasyTizen-Linux-x64.deb ;;
           esac
           ls -la out
       - uses: actions/upload-artifact@v4
