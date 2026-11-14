@@ -52,9 +52,9 @@ export function PackageStep({ pkg, onPackage }: { pkg: OpenedPackage | null; onP
           <IconTile><FileArchive size={20} aria-hidden /></IconTile>
           <div className="min-w-0 flex-1">
             <p className="truncate font-semibold">{r.app_name ?? r.file_name}</p>
-            <p className="flex items-center gap-1.5 text-xs text-[var(--ok)]"><ShieldCheck size={13} aria-hidden />{t("pkgSafe")}</p>
+            <p className="flex items-start gap-1.5 text-xs text-[var(--ok)]"><ShieldCheck size={13} className="mt-0.5 shrink-0" aria-hidden />{t("pkgSafe")}</p>
           </div>
-          <Button size="sm" variant="ghost" onClick={() => onPackage(null)}><X size={15} aria-hidden />{t("pkgClear")}</Button>
+          <Button size="sm" variant="ghost" aria-label={t("pkgClear")} title={t("pkgClear")} onClick={() => onPackage(null)}><X size={15} aria-hidden /><span className="hidden sm:inline">{t("pkgClear")}</span></Button>
         </div>
         <dl className="m-0 mt-3">
           {r.version && <Row label={t("pkgVersion")}>{r.version}</Row>}

@@ -232,12 +232,12 @@ mod issuance_tests {
 
     #[test]
     fn issue_author_and_distributor_then_sign_and_install() {
-        if Command::new("openssl").arg("version").output().is_err() {
+        if !crate::sign::openssl3_for_tests() {
             assert!(
                 std::env::var_os("EASYTIZEN_REQUIRE_INTEROP").is_none(),
                 "openssl is required"
             );
-            eprintln!("SKIPPED: openssl not installed");
+            eprintln!("SKIPPED: OpenSSL 3 is needed");
             return;
         }
         let tmp = tempfile::tempdir().unwrap();

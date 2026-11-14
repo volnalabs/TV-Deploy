@@ -1,29 +1,51 @@
-# Test report — Public Preview 0.1.0
+# Test report — EasyTizen 0.9.0
 
-## Automated tests present in the repository
+Date: 2026-11-14. Environment of the local runs: Linux x86_64 (Ubuntu 24.04 container), Rust 1.97, Node.js 22.23, OpenSSL 3, xmlsec1, Android SDK platform 36 / NDK 27.2.
 
-The project includes Rust unit/integration tests for input validation, WGT parsing and archive safety, Samsung CLI envelope parsing, diagnostics, redaction and process execution. It also includes a scripted end-to-end check which runs the vendored Samsung CLI scripts against a mock SDB executable, plus Vitest checks for localization and frontend utilities.
+This report states what was actually run and what it proves. Anything not listed under "Verified" has not been verified.
 
-The earlier development report recorded:
-- Rust workspace: 38 tests passed in the authoring Linux environment.
-- Frontend Vitest: 6 tests passed.
-- The mock-SDB test exercised the real vendored Samsung scripts, but **did not exercise a physical television**.
+## Verified automatically (all passing)
 
-## CI failures found during integration
+| Suite | Command | Result |
+|---|---|---|
+| Core (`easytizen-core`) | `EASYTIZEN_REQUIRE_INTEROP=1 cargo test -p easytizen-core --features mock-tv` | 68 tests passed |
+| App backend (`easytizen`) | `cargo test -p easytizen` | 18 tests passed |
+| Interface and release scripts | `npm test` | 13 tests passed |
+| Types | `npm run typecheck` | no errors |
+| Lints | `cargo clippy --workspace --all-targets --features easytizen-core/mock-tv -- -D warnings`, `cargo fmt --all -- --check` | clean |
 
-The latest development commit before this PR (`a492e58`) had four CI issues, now corrected in this PR:
-- Rust formatting differences in `easytizen-core/src/samsung/commands.rs`.
-- An unused React icon import, rejected by TypeScript's no-unused-locals check.
-- Missing `tempfile` dev-dependency for Tauri crate tests.
-- A moved-value error in the toolchain status response.
+What the important tests establish:
 
-The PR's live GitHub Actions checks are the authoritative validation for this patched tree. Do not treat the report as a pass until those checks complete successfully.
+* **SDB client ↔ TV emulator** — handshake, `capability:`, DUID retrieval, a 300 kB byte-exact push, device-side refusal of a bad path, install → launch, cleanup of the uploaded copy, cancellation, recognition of Android ADB endpoints. The emulator is our own implementation of the device side, so this proves internal consistency and correct framing, **not** behaviour of a real TV.
+* **WGT signing verified by an independent implementation** — keys and `.p12` files are produced by the OpenSSL CLI with the flags Samsung's CLI uses; both signature documents are then verified by `xmlsec1`, and a tampered file makes verification fail. This proves the XML-DSig output is cryptographically valid.
+* **Certificate issuance against an OpenSSL stand-in** — our CSRs are checked (`openssl req -verify`) and signed by OpenSSL acting as the CA; the test asserts the endpoint order, form fields, RSA-2048/SHA-512, and the `URN:tizen:deviceid=` SAN, then signs a package with the issued pair and installs it on the emulator. Keystores written by EasyTizen are read back by OpenSSL. Samsung's real service is **not** contacted.
+* **A package signed for one TV is refused by another** (emulated DUID check).
+* **WGT safety** — zip-slip names, DTD/entity bombs, oversized XML, non-ZIP input, duplicate entries; the original file is byte-identical after inspection and signing.
+* **SDK installer** — progress parsing, streaming of stdout/stderr, failure reporting, and cancellation that stops the installer's background children (process group kill). This test caught a real defect during development.
+* **Samsung OAuth callback** — loopback round trip, single decoding of the `code` value, timeout, cancellation, token redaction in debug output.
+* **Settings upgrade** from the TV Deploy 0.1 schema and **data-folder migration** from the old identifier.
+* **Release tooling** — a release is blocked when an installer is missing, too small or unexpected; every published file name appears in both READMEs, the release notes template and the in-app update check; repository versions agree.
 
-## Not tested yet
+## Verified by building and running locally
 
-- Physical Samsung TV connection, DUID, Samsung Account OAuth, online certificate issuance, signing and installation.
-- Visual interaction in a packaged desktop window.
-- Windows/macOS/Linux installers on real operating systems.
-- macOS Intel runner packaging on the replacement GitHub Actions image.
+| Target | What was done | Result |
+|---|---|---|
+| Linux `.deb` and `.AppImage` | `npx tauri build --bundles deb,appimage` | built: 48 MB and 118 MB; package `easy-tizen`, depends on `libwebkit2gtk-4.1-0`, `libgtk-3-0` |
+| Linux binary | started under Xvfb; window captured (`docs/img/linux-window.png`) | starts, first-run guide rendered, data folder `io.github.volnalabs.easytizen` created |
+| Android APK (arm64) | `npx tauri android build --apk --target aarch64` | built, 11.6 MB; `aapt2` shows package `io.github.volnalabs.easytizen`, version 0.9.0, permissions INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE; no Samsung CLI inside |
+| Interface | `scripts/screenshots.mjs` drives the real frontend through the whole flow on desktop and phone viewports with the demo backend | all 17 screens rendered without console errors |
 
-See [ACCEPTANCE-CHECKLIST.md](ACCEPTANCE-CHECKLIST.md) for the required manual verification.
+## Not verified
+
+* **Physical Samsung TV:** nothing — connection, DUID, certificate acceptance, installation, launch.
+* **Real Android device:** the APK was not installed or run.
+* **Real Samsung Account / Samsung CA.**
+* **Windows and macOS:** installers are produced by CI only; not run by hand. Code-signing steps in CI have never run with real certificates.
+* **Real Tizen SDK installation** through the app (15 GB download) and the SDK engine's signing/installing with the genuine `tz`/`sdb`.
+* **Android armv7 build** and the signed APK/AAB path — exercised in CI, not locally.
+
+## Tested TV models
+
+None yet. Please report results (model, year, Tizen version, EasyTizen version, engine) in an issue so this table can be filled.
+
+See [ACCEPTANCE-CHECKLIST.md](ACCEPTANCE-CHECKLIST.md) for the hands-on checks and [KNOWN-LIMITATIONS.md](KNOWN-LIMITATIONS.md) for limits.

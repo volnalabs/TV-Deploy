@@ -10,6 +10,8 @@ import type {
   SdkPreflight, Settings, ToolchainStatus, UpdateInfo,
 } from "../types";
 
+declare const __APP_VERSION__: string;
+const VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0.0";
 const params = new URLSearchParams(typeof location !== "undefined" ? location.search : "");
 const android = params.get("platform") === "android";
 const fresh = params.get("demo") === "fresh";
@@ -56,7 +58,7 @@ const guard = (opId: unknown) => (typeof opId === "string" && cancelled.has(opId
 
 type Args = Record<string, any>;
 const handlers: Record<string, (a: Args) => unknown> = {
-  app_info: (): AppInfo => ({ version: "1.0.0", platform: android ? "android" : "linux", arch: "x86_64", mobile: android, engines: android ? ["builtin"] : ["sdk", "builtin"], host_ip: "192.168.1.23" }),
+  app_info: (): AppInfo => ({ version: VERSION, platform: android ? "android" : "linux", arch: "x86_64", mobile: android, engines: android ? ["builtin"] : ["sdk", "builtin"], host_ip: "192.168.1.23" }),
   get_settings: () => structuredClone(settings),
   save_preferences: (a) => { Object.assign(settings, { theme: a.theme, language: a.language, default_port: a.defaultPort, timeout_ms: a.timeoutMs, check_updates: a.checkUpdates }); },
   set_engine: (a) => { settings.engine = a.engine; },
@@ -127,9 +129,9 @@ const handlers: Record<string, (a: Args) => unknown> = {
   uninstall_app: () => wait(600),
   get_history: () => structuredClone(history),
   clear_history: () => { history = []; },
-  diagnostics_report: () => "EasyTizen 1.0.0 — diagnostics (demo mode)\nPlatform: browser\nEngine: demo\nLocal address: 192.168.1.23 (subnet 192.168.1.x)\n\nSaved TVs: 2\n  192.168.1.57:26101  model=Tizen TV (emulated)  duid=…0001\n  192.168.1.84:26101  model=Tizen TV (emulated)  duid=…0002\n\nCertificate profiles: 1\n  EasyTizen-57  engine=Sdk  tvs=…0001",
+  diagnostics_report: () => `EasyTizen ${VERSION} — diagnostics (demo mode)\nPlatform: browser\nEngine: demo\nLocal address: 192.168.1.23 (subnet 192.168.1.x)\n\nSaved TVs: 2\n  192.168.1.57:26101  model=Tizen TV (emulated)  duid=…0001\n  192.168.1.84:26101  model=Tizen TV (emulated)  duid=…0002\n\nCertificate profiles: 1\n  EasyTizen-57  engine=Sdk  tvs=…0001`,
   save_text_file: () => undefined,
-  check_for_update: (): UpdateInfo => ({ current: "1.0.0", latest: "1.0.0", update_available: false, release_url: "https://github.com/volnalabs/TV-Deploy/releases/latest", download_url: "https://github.com/volnalabs/TV-Deploy/releases/latest" }),
+  check_for_update: (): UpdateInfo => ({ current: VERSION, latest: VERSION, update_available: false, release_url: "https://github.com/volnalabs/TV-Deploy/releases/latest", download_url: "https://github.com/volnalabs/TV-Deploy/releases/latest" }),
   open_external: (a) => { window.open(a.url, "_blank", "noopener"); },
 };
 

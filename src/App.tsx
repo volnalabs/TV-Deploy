@@ -101,7 +101,7 @@ function Shell({ info, settings, refresh }: { info: AppInfo; settings: Settings;
           <nav className="safe-bottom grid grid-cols-5 border-t border-[var(--border)] bg-[var(--surface)] lg:hidden">
             {NAV.map(({ page: p, icon: Icon, label }) => (
               <button key={p} type="button" aria-current={page === p ? "page" : undefined} onClick={() => setPage(p)}
-                className={`flex min-w-0 flex-col items-center gap-0.5 px-1 pt-2 pb-1.5 text-[10.5px] transition-colors ${page === p ? "font-medium text-[var(--accent)]" : "text-[var(--muted)]"}`}>
+                className={`flex min-w-0 flex-col items-center gap-0.5 pt-2 pb-1.5 text-[10px] tracking-tight transition-colors ${page === p ? "font-medium text-[var(--accent)]" : "text-[var(--muted)]"}`}>
                 <Icon size={20} aria-hidden /><span className="w-full truncate text-center">{t(label)}</span>
               </button>
             ))}

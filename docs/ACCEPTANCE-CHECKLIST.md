@@ -1,54 +1,42 @@
-# Manual acceptance checklist — physical Samsung TV
+# Hands-on acceptance checklist
 
-**Status: NOT YET EXECUTED.** Record the TV model/year, Tizen version, host OS, TV Deploy build and evidence for every run. Do not mark a check complete based only on mock tests.
+**Status: NOT YET EXECUTED.** Record the TV model and year, Tizen version, host device and OS, EasyTizen build and engine for every run. Do not tick a box on the strength of automated tests.
 
-## Setup and connection
+## A. Android app (built-in engine) — no computer involved
 
-- [ ] Install TV Deploy on Windows 10/11 x64.
-- [ ] Install TV Deploy on macOS Apple Silicon.
-- [ ] Install TV Deploy on macOS Intel.
-- [ ] Install TV Deploy on Ubuntu/Debian x64.
-- [ ] First-run setup downloads the official Tizen SDK and Samsung TV Extension, then reports the verified SDK path.
-- [ ] Existing SDK is detected and can be selected without modifying the user's existing Tizen Studio installation.
-- [ ] Low disk space, missing Bash 4+ on macOS, interrupted download and installer failure produce actionable messages.
-- [ ] Find my TV discovers a TV with Developer Mode enabled.
-- [ ] Manual IP connection works.
-- [ ] Connected is shown only after Samsung SDB confirms the connection.
-- [ ] DUID returned by Samsung tooling is displayed and remains associated with the selected TV.
-- [ ] Saved devices survive restart but are not shown as connected until revalidated.
-- [ ] Wrong IP, closed port, disabled Developer Mode and incorrect Host PC IP are diagnosed.
+- [ ] APK installs on Android 7–16; app starts; welcome guide shows the phone's Wi-Fi address.
+- [ ] "Find TVs" discovers a TV with Developer Mode on; progress bar moves; Cancel works.
+- [ ] Connect by IP works; the TV's DUID and model are shown.
+- [ ] Wrong IP / Developer Mode off / wrong Host PC IP each produce the matching explanation.
+- [ ] Picking a `.wgt` through the system picker shows its details; a non-WGT file is rejected with a clear message.
+- [ ] "Create certificate" opens Samsung sign-in in the browser; after signing in and returning to the app the certificate appears. Note whether the app had to be brought to the foreground manually.
+- [ ] Cancelling during sign-in returns to the form without leftovers; retrying works.
+- [ ] Install: stages advance, upload percentage moves, the app appears on the TV and launches.
+- [ ] After restarting the app, installing asks for the certificate password once; a wrong password is reported as such.
+- [ ] A package signed for TV A is refused by TV B with the "signature rejected" message.
+- [ ] Installing over an app signed by another author offers "Remove the old copy…", which works.
+- [ ] Importing `author.p12` + `distributor.p12` exported from Tizen Studio works.
+- [ ] Rotation, dark/light theme, Russian/English, back gesture, small screens.
 
-## Package validation
+## B. Desktop — official Samsung tools
 
-- [ ] A valid unsigned WGT is accepted and its name, package ID, version and size are shown.
-- [ ] A valid signed WGT is accepted and described only as structurally signed until trusted verification is performed.
-- [ ] Empty, non-ZIP, wrong-extension and malformed config.xml files are rejected.
-- [ ] Zip-slip entries, excessive entries, oversized XML and suspicious compression ratios are rejected.
-- [ ] Original WGT remains byte-for-byte unchanged throughout signing and installation.
+- [ ] Installer works on Windows 10/11, macOS (Apple silicon and Intel), Ubuntu/Debian (`.deb`) and one more distribution (AppImage).
+- [ ] "Install automatically": folder and free space shown; progress by package; Cancel stops all downloads; "Resume" finishes the installation.
+- [ ] Too little disk space and a path with spaces are refused before anything is downloaded.
+- [ ] "Use an existing SDK" accepts a Tizen Studio folder and leaves the user's own Tizen configuration untouched.
+- [ ] Scan, connect, DUID, certificate creation (browser sign-in), signing with `tz`, installation and launch all succeed.
+- [ ] Certificate import through the Samsung certificate manager works.
+- [ ] Upgrade from TV Deploy 0.1: saved TVs, SDK path and profiles are present after first start.
 
-## Certificates and installation
+## C. Desktop — built-in engine
 
-- [ ] Samsung Account OAuth opens in the system browser and returns to TV Deploy.
-- [ ] Author Certificate is created by the official Samsung certificate manager.
-- [ ] Distributor Certificate contains the selected TV DUID.
-- [ ] Signing profile is created and selected for the same TV.
-- [ ] A second TV cannot accidentally use a DUID-bound profile from the first TV.
-- [ ] A signed working copy is produced by the Tizen SDK; no original WGT is overwritten.
-- [ ] Samsung install command succeeds and the TV confirms the application is installed.
-- [ ] Optional launch-after-install starts the app.
-- [ ] Invalid certificate, expired/failed Samsung authorization and install failure show a useful error.
+- [ ] Switching the engine in Settings works; certificates of the other engine are shown as unavailable.
+- [ ] The same end-to-end flow as in section A succeeds from a computer.
 
-## UI and resilience
+## D. Cross-cutting
 
-- [ ] File picker and drag-and-drop both work.
-- [ ] Russian/English language switching works.
-- [ ] Light/dark/system themes work.
-- [ ] Cancel during scan/connect does not leave a stuck process.
-- [ ] Relaunching TV Deploy does not falsely restore a stale connected state.
-
-## Release readiness
-
-- [ ] CI passes on Windows, macOS and Linux.
-- [ ] The four platform build jobs produce the expected installer artifacts.
-- [ ] Windows and macOS signing/notarization status is clearly shown.
-- [ ] README instructions match the packaged application.
+- [ ] Original `.wgt` is byte-identical after installation (compare SHA-256).
+- [ ] History lists successes and failures with the TV's message; Clear works.
+- [ ] Diagnostics report contains no passwords, tokens or full DUIDs; Copy and Save work.
+- [ ] Update banner appears when a newer release exists and links to the right installer.
+- [ ] Release workflow publishes exactly six installers plus `SHA256SUMS.txt`; every `releases/latest/download/…` link in the README downloads a file.

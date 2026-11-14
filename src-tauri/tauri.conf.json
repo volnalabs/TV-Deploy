@@ -67,6 +67,10 @@
     },
     "android": {
       "minSdkVersion": 24
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "-"
     }
   }
 }

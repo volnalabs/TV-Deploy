@@ -23,17 +23,21 @@ use std::time::Duration;
 const PASSWORD: &str = "Passw0rdX";
 const DUID: &str = "MOCKDUID1234ABCD";
 
-fn tool(name: &str) -> bool {
-    Command::new(name)
+/// The test drives OpenSSL 3 options (`-copy_extensions`, `-addext`); macOS ships LibreSSL.
+pub(crate) fn openssl3() -> bool {
+    Command::new("openssl")
+        .arg("version")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).starts_with("OpenSSL 3"))
+        .unwrap_or(false)
+}
+
+fn xmlsec1() -> bool {
+    Command::new("xmlsec1")
         .arg("--version")
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-        || Command::new(name)
-            .arg("version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
 }
 
 fn run(dir: &Path, program: &str, args: &[&str]) {
@@ -174,12 +178,12 @@ fn xmlsec_verifies(dir: &Path, file: &str) -> bool {
 
 #[test]
 fn sign_verify_with_xmlsec_and_install_on_emulated_tv() {
-    if !(tool("openssl") && tool("xmlsec1")) {
+    if !(openssl3() && xmlsec1()) {
         assert!(
             std::env::var_os("EASYTIZEN_REQUIRE_INTEROP").is_none(),
             "openssl and xmlsec1 are required for the signing interop test"
         );
-        eprintln!("SKIPPED: openssl/xmlsec1 not installed");
+        eprintln!("SKIPPED: OpenSSL 3 and xmlsec1 are needed");
         return;
     }
     let tmp = tempfile::tempdir().unwrap();

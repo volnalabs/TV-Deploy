@@ -29,10 +29,10 @@ export function EngineChoice() {
             <button key={engine} type="button" role="radio" aria-checked={active} onClick={() => void choose(engine)}
               className={`rounded-xl border p-4 text-left transition-colors ${active ? "border-[var(--accent)] bg-[var(--accent-soft)]" : "border-[var(--border-strong)] hover:bg-[var(--surface-2)]"}`}>
               <div className="flex items-center gap-2.5">
-                <Icon size={18} className={active ? "text-[var(--accent)]" : "text-[var(--muted)]"} aria-hidden />
+                <Icon size={18} className={`shrink-0 ${active ? "text-[var(--accent)]" : "text-[var(--muted)]"}`} aria-hidden />
                 <span className="min-w-0 flex-1 font-semibold">{title}</span>
-                <Pill tone={tone}>{tag}</Pill>
               </div>
+              <div className="mt-2"><Pill tone={tone}>{tag}</Pill></div>
               <p className="mt-2 text-[13px] text-[var(--muted)]">{body}</p>
             </button>
           );

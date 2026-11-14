@@ -17,3 +17,8 @@ pub use wgt::{sign_wgt, SignError};
 
 #[cfg(all(test, unix))]
 mod interop_tests;
+
+#[cfg(all(test, unix))]
+pub(crate) fn openssl3_for_tests() -> bool {
+    interop_tests::openssl3()
+}

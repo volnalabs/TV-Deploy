@@ -1,73 +1,212 @@
-name: Build and release
+name: Build installers
+
+# Builds every installer under its final, published file name:
+#   EasyTizen-Android.apk               EasyTizen-Windows-x64-Setup.exe
+#   EasyTizen-macOS-ARM64.dmg           EasyTizen-macOS-Intel.dmg
+#   EasyTizen-Linux-x64.AppImage        EasyTizen-Linux-x64.deb
+# Code signing is used when the corresponding secrets exist and is never faked when they
+# do not — see docs/RELEASING.md.
 
 on:
-  workflow_dispatch:
-  push:
-    branches: [development]
-    tags: ["v*"]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    outputs:
+      signing_android:
+        description: "release | temporary"
+        value: ${{ jobs.signing.outputs.android }}
+      signing_windows:
+        description: "signed | unsigned"
+        value: ${{ jobs.signing.outputs.windows }}
+      signing_macos:
+        description: "notarized | adhoc"
+        value: ${{ jobs.signing.outputs.macos }}
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  # Which signing material is configured. Only presence is inspected, never the values.
+  signing:
+    name: Signing configuration
+    runs-on: ubuntu-22.04
+    outputs:
+      android: ${{ steps.s.outputs.android }}
+      windows: ${{ steps.s.outputs.windows }}
+      macos: ${{ steps.s.outputs.macos }}
+    steps:
+      - id: s
+        env:
+          HAS_ANDROID: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' }}
+          HAS_WINDOWS: ${{ secrets.WINDOWS_CERTIFICATE != '' && secrets.WINDOWS_CERTIFICATE_PASSWORD != '' }}
+          HAS_MACOS: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_SIGNING_IDENTITY != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        run: |
+          [ "$HAS_ANDROID" = "true" ] && echo "android=release" >> "$GITHUB_OUTPUT" || echo "android=temporary" >> "$GITHUB_OUTPUT"
+          [ "$HAS_WINDOWS" = "true" ] && echo "windows=signed" >> "$GITHUB_OUTPUT" || echo "windows=unsigned" >> "$GITHUB_OUTPUT"
+          [ "$HAS_MACOS" = "true" ] && echo "macos=notarized" >> "$GITHUB_OUTPUT" || echo "macos=adhoc" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  desktop:
     name: ${{ matrix.name }}
+    needs: signing
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { name: Windows-x64, os: windows-latest, node: win-x64, args: "" }
-          - { name: macOS-ARM64, os: macos-latest, node: darwin-arm64, args: "--target aarch64-apple-darwin" }
-          - { name: macOS-x64, os: macos-15-intel, node: darwin-x64, args: "--target x86_64-apple-darwin" }
-          - { name: Linux-x64, os: ubuntu-22.04, node: linux-x64, args: "" }
+          - { name: Windows-x64, os: windows-latest, node: win-x64, target: "", bundles: nsis }
+          - { name: macOS-ARM64, os: macos-latest, node: darwin-arm64, target: aarch64-apple-darwin, bundles: dmg }
+          - { name: macOS-Intel, os: macos-15-intel, node: darwin-x64, target: x86_64-apple-darwin, bundles: dmg }
+          - { name: Linux-x64, os: ubuntu-22.04, node: linux-x64, target: "", bundles: "appimage,deb" }
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-      - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-22.04'
+      - name: Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ startsWith(matrix.node, 'darwin') && (matrix.node == 'darwin-arm64' && 'aarch64-apple-darwin' || 'x86_64-apple-darwin') || '' }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - run: npm ci
       - name: Download and verify the bundled Node.js runtime
         run: node scripts/fetch-node.mjs ${{ matrix.node }}
-      - name: Build TV Deploy
-        run: npx tauri build ${{ matrix.args }}
+
+      - name: Import the Windows code-signing certificate
+        if: runner.os == 'Windows' && needs.signing.outputs.windows == 'signed'
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          Remove-Item $pfx
+          @{ bundle = @{ windows = @{ certificateThumbprint = $cert.Thumbprint; digestAlgorithm = "sha256"; timestampUrl = "http://timestamp.digicert.com" } } } |
+            ConvertTo-Json -Depth 5 | Out-File -Encoding ascii sign.conf.json
+
+      - name: Enable macOS Developer ID signing and notarization
+        if: runner.os == 'macOS' && needs.signing.outputs.macos == 'notarized'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          {
+            echo "APPLE_CERTIFICATE=$APPLE_CERTIFICATE"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          args=(--bundles "${{ matrix.bundles }}")
+          if [ -n "${{ matrix.target }}" ]; then args+=(--target "${{ matrix.target }}"); fi
+          if [ -f sign.conf.json ]; then args+=(--config sign.conf.json); fi
+          npx tauri build "${args[@]}"
+
+      - name: Collect installers under their published names
+        run: |
+          mkdir -p out
+          shopt -s globstar nullglob
+          one() { # exactly one file must match the glob
+            if [ "$#" -ne 1 ]; then echo "expected exactly one file, got $#: $*" >&2; exit 1; fi
+            echo "$1"
+          }
+          case "${{ matrix.name }}" in
+            Windows-x64) cp "$(one target/**/release/bundle/nsis/*.exe)" out/EasyTizen-Windows-x64-Setup.exe ;;
+            macOS-ARM64) cp "$(one target/**/release/bundle/dmg/*.dmg)" out/EasyTizen-macOS-ARM64.dmg ;;
+            macOS-Intel) cp "$(one target/**/release/bundle/dmg/*.dmg)" out/EasyTizen-macOS-Intel.dmg ;;
+            Linux-x64)
+              cp "$(one target/**/release/bundle/appimage/*.AppImage)" out/EasyTizen-Linux-x64.AppImage
+              cp "$(one target/**/release/bundle/deb/*.deb)" out/EasyTizen-Linux-x64.deb ;;
+          esac
+          ls -la out
       - uses: actions/upload-artifact@v4
         with:
-          name: TV-Deploy-${{ matrix.name }}
-          path: |
-            target/**/release/bundle/**/*.exe
-            target/**/release/bundle/**/*.dmg
-            target/**/release/bundle/**/*.AppImage
-            target/**/release/bundle/**/*.deb
+          name: installer-${{ matrix.name }}
+          path: out/*
           if-no-files-found: error
 
-  release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  android:
+    name: Android
+    needs: signing
+    runs-on: ubuntu-22.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          path: release-assets
-      - name: Publish unsigned platform installers
-        uses: softprops/action-gh-release@v2
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
         with:
-          name: TV Deploy ${{ github.ref_name }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: release-assets/**/*
+          distribution: temurin
+          java-version: 21
+      - uses: android-actions/setup-android@v3
+      - name: Android platform, build tools and NDK
+        run: |
+          sdkmanager --install "platforms;android-36" "build-tools;35.0.0" "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+
+      - name: Signing key
+        env:
+          STATE: ${{ needs.signing.outputs.android }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          store="$RUNNER_TEMP/easytizen.jks"
+          if [ "$STATE" = "release" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$store"
+            password="$ANDROID_KEYSTORE_PASSWORD"; alias="$ANDROID_KEY_ALIAS"
+          else
+            # Android refuses unsigned APKs, so without the project's key the build is signed
+            # with a throw-away key. The release notes say so; it is never presented as the
+            # project's signature.
+            password="$(openssl rand -hex 16)"; alias="temporary"
+            keytool -genkeypair -keystore "$store" -storepass "$password" -keypass "$password" -alias "$alias" \
+              -keyalg RSA -keysize 2048 -validity 3650 -dname "CN=EasyTizen temporary build key"
+          fi
+          printf 'storeFile=%s\npassword=%s\nkeyAlias=%s\n' "$store" "$password" "$alias" > src-tauri/gen/android/keystore.properties
+
+      - name: Build APK and AAB
+        run: npx tauri android build --apk --aab --target aarch64 armv7
+
+      - name: Collect
+        run: |
+          mkdir -p out play
+          cp src-tauri/gen/android/app/build/outputs/apk/universal/release/app-universal-release.apk out/EasyTizen-Android.apk
+          cp src-tauri/gen/android/app/build/outputs/bundle/universalRelease/app-universal-release.aab play/EasyTizen-Android-GooglePlay.aab
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs out/EasyTizen-Android.apk | head -3
+          rm -f src-tauri/gen/android/keystore.properties
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installer-Android
+          path: out/*
+          if-no-files-found: error
+      # The AAB is for a Google Play upload only. It is kept as a workflow artifact and is
+      # deliberately NOT attached to the GitHub Release: it cannot be installed by hand.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: google-play-bundle
+          path: play/*
+          if-no-files-found: error
