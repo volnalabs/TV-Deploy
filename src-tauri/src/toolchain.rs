@@ -1,8 +1,8 @@
 //! Locating the bundled Node.js runtime, the vendored Samsung CLI and the Tizen SDK.
 
+use easytizen_core::samsung::runner::{sdb_path, Toolchain};
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
-use easytizen_core::samsung::runner::{sdb_path, Toolchain};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,7 +82,10 @@ pub fn build(
 pub fn sdk_is_usable(p: &Path) -> bool {
     sdb_path(p).is_file()
         && p.join("sdk.info").is_file()
-        && p.join("tools").join("tizen-core").join(if cfg!(windows) { "tz.exe" } else { "tz" }).is_file()
+        && p.join("tools")
+            .join("tizen-core")
+            .join(if cfg!(windows) { "tz.exe" } else { "tz" })
+            .is_file()
 }
 
 /// Whether the Samsung TV Extension has been installed by the official installer.

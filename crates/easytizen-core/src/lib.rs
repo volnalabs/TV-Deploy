@@ -11,4 +11,5 @@ pub mod samsung;
 pub mod samsung_ca;
 pub mod sdb;
 pub mod sign;
+pub mod update;
 pub mod validate;

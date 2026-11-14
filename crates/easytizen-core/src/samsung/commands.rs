@@ -140,13 +140,15 @@ impl Invocation {
         duid: &str,
     ) -> Result<Self, ValidationError> {
         validate_profile(profile)?;
-        if duid.is_empty()
-            || duid.len() > 256
-            || duid.chars().any(|c| c.is_control())
-            || !duid
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"#.-:_".contains(&b))
-        {
+        // One DUID or a comma-separated list of them.
+        let valid = !duid.is_empty()
+            && duid.len() <= 4096
+            && duid.split(',').all(|d| {
+                (4..=128).contains(&d.len())
+                    && d.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"#.-:_=".contains(&b))
+            });
+        if !valid {
             return Err(ValidationError::BadPath);
         }
         Ok(Self {
@@ -173,6 +175,33 @@ impl Invocation {
                 "--profile-name".into(),
                 profile.to_string(),
                 "--active".into(),
+            ],
+        })
+    }
+
+    /// Imports an existing `.p12` into the SDK keystore. The password is supplied through
+    /// the hidden-prompt environment variable, never on the command line.
+    pub fn import_samsung_certificate(
+        profile: &str,
+        source: &str,
+        kind: &str,
+    ) -> Result<Self, ValidationError> {
+        validate_profile(profile)?;
+        check_cli_path(source)?;
+        if kind != "author" && kind != "distributor" {
+            return Err(ValidationError::BadPath);
+        }
+        Ok(Self {
+            script: Script::CertManager,
+            args: vec![
+                "import-samsung-certificate".into(),
+                "--profile-name".into(),
+                profile.to_string(),
+                "--source".into(),
+                source.to_string(),
+                "--certificate-type".into(),
+                kind.to_string(),
+                "--prompt-password".into(),
             ],
         })
     }
@@ -247,6 +276,32 @@ mod tests {
         );
         assert!(Invocation::scan(Some("192.168.1; ls"), 26101, 3000).is_err());
         assert!(Invocation::scan(None, 26101, 5).is_err());
+    }
+
+    #[test]
+    fn certificate_args_never_carry_passwords_and_reject_injection() {
+        let d = Invocation::generate_samsung_distributor("My-Profile", "AAAA1111,2.0#BBBB2222")
+            .unwrap();
+        assert_eq!(d.args[4], "AAAA1111,2.0#BBBB2222");
+        assert!(d.args.contains(&"--prompt-password".to_string()));
+        assert!(Invocation::generate_samsung_distributor("My-Profile", "AAAA1111, --x").is_err());
+        assert!(Invocation::generate_samsung_distributor("My Profile", "AAAA1111").is_err());
+        #[cfg(unix)]
+        {
+            let i = Invocation::import_samsung_certificate("My-Profile", "/tmp/a.p12", "author")
+                .unwrap();
+            assert!(!i
+                .args
+                .iter()
+                .any(|a| a.to_lowercase().contains("password=")));
+            assert!(
+                Invocation::import_samsung_certificate("My-Profile", "/tmp/a.p12", "root").is_err()
+            );
+            assert!(
+                Invocation::import_samsung_certificate("My-Profile", "--overwrite", "author")
+                    .is_err()
+            );
+        }
     }
 
     #[test]

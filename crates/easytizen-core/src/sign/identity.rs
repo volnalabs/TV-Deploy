@@ -175,3 +175,10 @@ pub fn write_p12(
         .write()
         .map_err(|_| IdentityError::WriteFailed)
 }
+
+impl SigningIdentity {
+    /// Re-encrypts this identity as a new PKCS#12 keystore under `password`.
+    pub fn repack(&self, alias: &str, password: &str) -> Result<Vec<u8>, IdentityError> {
+        write_p12(&self.key, &self.chain, alias, password)
+    }
+}

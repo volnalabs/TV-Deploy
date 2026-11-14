@@ -23,6 +23,8 @@ pub enum Diagnosis {
     ConnectionRejected,
     OperationTimedOut,
     Cancelled,
+    /// The address answered like an Android (ADB) device, not a Samsung TV.
+    NotATv,
     /// Samsung CLI crashed or printed nothing parseable.
     CliFailure,
     Unknown,
@@ -35,6 +37,19 @@ pub fn from_probe(p: Probe) -> Option<Diagnosis> {
         Probe::TimedOut => Some(Diagnosis::TvUnreachable),
         Probe::NetworkUnreachable => Some(Diagnosis::NetworkUnreachable),
         Probe::Other => Some(Diagnosis::TvUnreachable),
+    }
+}
+
+/// Explains a failure of the built-in SDB engine.
+pub fn from_sdb_error(e: &crate::sdb::SdbError) -> Diagnosis {
+    use crate::sdb::SdbError::*;
+    match e {
+        Timeout => Diagnosis::OperationTimedOut,
+        Refused => Diagnosis::PortClosed,
+        Unreachable => Diagnosis::NetworkUnreachable,
+        NotTizen => Diagnosis::NotATv,
+        Cancelled => Diagnosis::Cancelled,
+        Io(_) | Protocol(_) | ServiceRefused(_) | SyncFailed(_) => Diagnosis::ConnectionRejected,
     }
 }
 
@@ -111,6 +126,7 @@ pub fn redact(s: &str) -> String {
                 || low.contains("passwd")
                 || low.contains("token")
                 || low.contains("secret")
+                || low.contains("private key")
             {
                 "[redacted line]".to_string()
             } else {
