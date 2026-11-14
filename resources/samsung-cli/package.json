@@ -1,5 +1,5 @@
 {
-  "name": "tvdeploy-samsung-cli",
+  "name": "easytizen-samsung-cli",
   "private": true,
   "type": "commonjs",
   "description": "Marks the vendored Samsung scripts as CommonJS regardless of any parent package.json (e.g. the app's own \"type\": \"module\")."

@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "TV Deploy",
-  "version": "0.1.0",
-  "identifier": "io.github.volnalabs.tvdeploy",
+  "productName": "EasyTizen",
+  "version": "0.9.0",
+  "identifier": "io.github.volnalabs.easytizen",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -11,7 +11,15 @@
   },
   "app": {
     "windows": [
-      { "title": "TV Deploy", "width": 1040, "height": 720, "minWidth": 880, "minHeight": 600, "center": true, "dragDropEnabled": true }
+      {
+        "title": "EasyTizen",
+        "width": 1120,
+        "height": 780,
+        "minWidth": 380,
+        "minHeight": 560,
+        "center": true,
+        "dragDropEnabled": true
+      }
     ],
     "security": {
       "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
@@ -19,14 +27,50 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "targets": [
+      "nsis",
+      "dmg",
+      "appimage",
+      "deb"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
     "resources": {
       "../resources/samsung-cli/": "samsung-cli/",
       "../resources/node/": "node/"
     },
     "category": "Utility",
-    "shortDescription": "A simple and modern application installer for Samsung Smart TVs.",
-    "licenseFile": "../LICENSE"
+    "publisher": "volnalabs",
+    "copyright": "EasyTizen contributors, Apache-2.0",
+    "shortDescription": "The easy way to install apps on Samsung Smart TVs.",
+    "longDescription": "EasyTizen finds your Samsung TV, issues the certificate it requires, then checks, signs and installs your .wgt app.",
+    "licenseFile": "../LICENSE",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "English",
+          "Russian"
+        ],
+        "displayLanguageSelector": false
+      }
+    },
+    "linux": {
+      "deb": {
+        "section": "utils"
+      }
+    },
+    "android": {
+      "minSdkVersion": 24
+    },
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "signingIdentity": "-"
+    }
   }
 }

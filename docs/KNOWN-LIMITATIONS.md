@@ -1,33 +1,32 @@
-# Known limitations — Public Preview 0.1.0
+# Known limitations — EasyTizen 0.9
 
-This document distinguishes code that is implemented from behavior that has been verified on actual hardware.
+This page separates what is implemented from what has been confirmed, and lists real limits.
 
-## Implemented in the current source
+## Not yet confirmed on hardware
 
-- Official Samsung/Tizen SDK and Samsung TV Extension installer orchestration (Windows PowerShell; Bash 4+ on macOS/Linux).
-- Existing SDK discovery and SDK path initialization in TV Deploy's private HOME.
-- Samsung CLI-based LAN scan, SDB connect/disconnect and DUID retrieval.
-- Read-only WGT inspection with archive/path/size guards and config.xml metadata extraction.
-- Samsung Author Certificate and DUID-bound Distributor Certificate creation through the pinned Samsung CLI, using Samsung Account OAuth in the system browser.
-- Signing-profile creation and WGT signing to a separate working copy through the Tizen Core `tz pack` command.
-- Installation of the signed WGT through Samsung's `project-manager-cli install` command, with optional launch after installation.
-- Local settings, saved devices, Russian/English strings and light/dark/system themes.
+1. **No physical Samsung TV was available.** Connection, DUID retrieval, installation and launch were verified against a protocol-level TV emulator (`crates/easytizen-core/src/sdb/mock.rs`) written from the SDB protocol and Samsung's tools — not against a television. The exact device commands (`0 getduid`, `0 vd_appinstall`, `0 was_execute`) are the ones Samsung's tooling uses, but their behaviour on specific models and firmware years is unverified.
+2. **No real Android device.** The APK and AAB build (arm64 and armv7) and the manifest was inspected, but the app has not been run on a phone. In particular: the document picker → backend hand-off, the system browser round trip for Samsung sign-in, and LAN access on Android 14–16.
+3. **Samsung's services were not contacted.** OAuth and certificate issuance were tested against a local stand-in whose CA role is played by the OpenSSL CLI. The request shapes follow Samsung's open-source CLI; a real Samsung Account sign-in and a real certificate were not exercised.
+4. **Windows and macOS installers** are built only in CI; they have not been installed and run by hand. The Linux `.deb`/AppImage were built locally and the binary was started under Xvfb.
+5. **The SDK engine's end-to-end path** (official `tz pack` signing and Samsung CLI install) still relies on the mock-`sdb` test inherited from 0.1 — no real SDK installation (15 GB) was performed in the authoring environment.
 
-## Not yet verified / not implemented
+## Real limits of this version
 
-1. **Physical Samsung TV acceptance has not been completed.** The automated end-to-end test drives the genuine Samsung scripts against a mock SDB executable. That checks argv and JSON handling, not a real TV, actual Samsung Account authorization or the online certificate authority.
-2. **Native desktop visual QA is pending.** Drag-and-drop, layout, theme changes and dialogs still need a visual pass in a packaged app on each OS.
-3. **Cross-platform packaging must be confirmed by PR CI.** The build matrix is configured for Windows x64, macOS ARM64, macOS Intel and Linux x64; do not claim an artifact exists until the corresponding job succeeds.
-4. **macOS requires Bash 4+.** The built-in /bin/bash on macOS is often 3.2, while the Samsung installer requires a newer Bash. The current app reports this requirement; it does not bootstrap Bash or Homebrew.
-5. **Signature status before signing is structural only.** Presence and XML shape of signature files are checked; this is not a cryptographic trust-chain or DUID verification. The official Tizen signing command is used for signing, and the Samsung CLI response is checked before reporting installation success.
-6. **Certificate import UI is not implemented.** Users can create a new Samsung online-CA author/distributor pair and profile; migrating an existing certificate from a separate Tizen Studio installation requires a manual workflow.
-7. **No installation history yet.** The app does not currently keep a dedicated, searchable installation history.
-8. **No app self-updater.** Updates to TV Deploy are currently delivered through GitHub Releases.
-9. **Artifacts are unsigned.** Windows code signing, macOS Developer ID signing and notarization are not configured until signing secrets are provided.
-10. **Node checksum authenticity.** The bundled Node runtime archive is checked against the SHA-256 value in the HTTPS-hosted SHASUMS file; GPG verification of that checksum manifest is not implemented yet.
-11. **SDK setup progress/cancellation.** SDK installer output is captured and surfaced on failure, but granular live progress and cancellation of a long-running vendor installer are not yet provided.
-12. **Supported package type.** The UI intentionally accepts `.wgt` only. Other Tizen package extensions are not claimed as Samsung TV-compatible.
+* **Built-in engine is experimental.** Its signatures are verified by `xmlsec1`, but a TV is the final judge. Desktop defaults to the official Samsung tools for that reason.
+* **Android 17 (API 37)** makes local-network access a runtime permission for apps that target it. EasyTizen targets API 36, where this does not apply. The permission flow must be added before raising the target.
+* **Samsung sign-in on Android** returns to `http://localhost:<port>`. If the phone freezes background apps aggressively, the browser page keeps loading until you switch back to EasyTizen.
+* **TV discovery** scans one /24 subnet of the primary interface. Larger or segmented networks need the TV's address typed in.
+* **One connection at a time** in the built-in SDB client; no persistent connection is kept between operations.
+* **Certificate password** (built-in engine) is asked once per app session and never stored. A forgotten password cannot be recovered — create a new certificate.
+* **Certificates are per engine.** Moving between the SDK keystore and the built-in store means importing the `.p12` files.
+* **Uninstalling an app from the TV** from within EasyTizen is available in the built-in engine only.
+* **macOS + official tools** needs Bash 4+ (`brew install bash`); EasyTizen reports this but does not install it.
+* **Signature check before installation is structural** (both signature documents present and well-formed), not a trust-chain validation.
+* **Update check only.** EasyTizen links to the new installer; it does not download or install updates by itself.
+* **Code signing** of Windows/macOS builds and a stable Android key depend on repository secrets (see RELEASING.md). Without them: unsigned Windows installer, ad-hoc signed macOS app, Android APK signed with a per-build throw-away key.
+* **Node.js runtime integrity** (desktop) is checked against the SHA-256 published over HTTPS by nodejs.org; the GPG signature of that list is not verified.
+* **Only `.wgt`** packages are supported.
 
 ## Release gate
 
-Do not publish a production `1.0.0` until the manual checklist in [ACCEPTANCE-CHECKLIST.md](ACCEPTANCE-CHECKLIST.md) is completed on at least one physical Samsung TV and the platform build jobs have produced valid installers.
+`1.0.0` must not be published until the hands-on [acceptance checklist](ACCEPTANCE-CHECKLIST.md) is completed on at least one physical Samsung TV with both the desktop and the Android app.

@@ -1,44 +1,21 @@
 name: CI
+
 on:
-  push: { branches: [main, development] }
+  push:
+    branches: [main]
   pull_request:
-permissions: { contents: read }
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  core:
-    name: Rust core tests (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix: { os: [ubuntu-latest, macos-latest, windows-latest] }
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22 }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { components: "clippy, rustfmt" }
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt -p tvdeploy-core -- --check
-      - run: cargo clippy -p tvdeploy-core --all-targets -- -D warnings
-      - run: cargo test -p tvdeploy-core
-  frontend:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: npm ci
-      - run: npm run typecheck
-      - run: npm test
-      - run: npx vite build
-  tauri-check:
-    name: Tauri crate compiles (Linux)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: npm }
-      - run: npm ci && npx vite build
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test -p tv-deploy
+  checks:
+    uses: ./.github/workflows/checks.yml
+  build:
+    needs: checks
+    uses: ./.github/workflows/build.yml
+    secrets: inherit

@@ -1,13 +1,13 @@
 [package]
-name = "tv-deploy"
-description = "A simple and modern application installer for Samsung Smart TVs."
+name = "easytizen"
+description = "The easy way to install apps on Samsung Smart TVs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [lib]
-name = "tv_deploy_lib"
+name = "easytizen_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -19,7 +19,9 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 fs2 = "0.4"
-tvdeploy-core = { path = "../crates/tvdeploy-core" }
+easytizen-core = { path = "../crates/easytizen-core" }
+tauri-plugin-opener = "2"
+tauri-plugin-fs = "2"
 
 [dev-dependencies]
 tempfile = "3"

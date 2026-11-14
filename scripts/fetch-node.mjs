@@ -2,8 +2,7 @@
 // Downloads the pinned official Node.js runtime for a target platform into resources/node/
 // and verifies its SHA-256 against nodejs.org's SHASUMS256.txt. Run in CI before `tauri build`.
 // Usage: node scripts/fetch-node.mjs <win-x64|darwin-arm64|darwin-x64|linux-x64>
-// NOTE: not executed in the authoring sandbox (nodejs.org was unreachable there); first real
-// run happens in GitHub Actions. TODO(iteration 4): also verify SHASUMS256.txt.sig (GPG).
+// The GPG signature of SHASUMS256.txt is not verified (see docs/KNOWN-LIMITATIONS.md).
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync, rmSync, copyFileSync, chmodSync, readdirSync } from "node:fs";
@@ -33,8 +32,10 @@ if (actual !== expected) throw new Error(`SHA-256 mismatch for ${spec.file}`);
 const tmp = join("resources", ".node-tmp");
 rmSync(tmp, { recursive: true, force: true }); mkdirSync(tmp, { recursive: true });
 const archive = join(tmp, spec.file); writeFileSync(archive, data);
-if (spec.file.endsWith(".zip")) execFileSync("tar", ["-xf", archive, "-C", tmp]); // bsdtar on Windows runners
-else execFileSync("tar", ["-xf", archive, "-C", tmp]);
+// Windows: the .zip needs bsdtar. Call the system one explicitly — in Git Bash the first
+// `tar` on PATH is GNU tar, which cannot read zip archives.
+const tar = process.platform === "win32" ? join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe") : "tar";
+execFileSync(tar, ["-xf", archive, "-C", tmp], { stdio: ["ignore", "inherit", "inherit"] });
 const dir = join(tmp, readdirSync(tmp).find((d) => d.startsWith("node-v") && !d.endsWith(spec.file.split(".").pop())) ?? "");
 const out = join("resources", "node"); mkdirSync(out, { recursive: true });
 const dest = join(out, target === "win-x64" ? "node.exe" : "node");

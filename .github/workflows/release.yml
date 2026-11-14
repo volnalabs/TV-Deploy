@@ -1,0 +1,100 @@
+name: Release
+
+# Publishes a GitHub Release with every installer.
+#
+# Start it from the Actions tab ("Run workflow") with the version to publish, e.g. 1.0.0.
+# The version must already be set in package.json, Cargo.toml and src-tauri/tauri.conf.json
+# and have a section in CHANGELOG.md. The workflow creates the tag v<version> itself and
+# refuses to run if that tag already exists.
+#
+# Nothing is published unless the checks pass AND all six installers were built.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 1.0.0) — must match the repository"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION#v}"
+          node scripts/release.mjs check-version "$version"
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "Tag v$version already exists. Bump the version instead of re-releasing." >&2
+            exit 1
+          fi
+          if ! grep -q "^## \[\?$version\]\?" CHANGELOG.md; then
+            echo "CHANGELOG.md has no section for $version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: prepare
+    uses: ./.github/workflows/checks.yml
+
+  build:
+    needs: [prepare, checks]
+    uses: ./.github/workflows/build.yml
+    secrets: inherit
+
+  publish:
+    name: Publish GitHub Release
+    # Runs only when every check and every platform build succeeded.
+    needs: [prepare, checks, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: installer-*
+          path: release
+          merge-multiple: true
+      - name: Verify installers, compute SHA-256, write release notes
+        env:
+          SIGNING_ANDROID: ${{ needs.build.outputs.signing_android }}
+          SIGNING_WINDOWS: ${{ needs.build.outputs.signing_windows }}
+          SIGNING_MACOS: ${{ needs.build.outputs.signing_macos }}
+        run: |
+          node scripts/release.mjs verify release
+          node scripts/release.mjs notes release "${{ needs.prepare.outputs.version }}" release-notes.md
+          cat release/SHA256SUMS.txt
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: EasyTizen ${{ needs.prepare.outputs.version }}
+          body_path: release-notes.md
+          files: release/*
+          fail_on_unmatched_files: true
+          make_latest: true

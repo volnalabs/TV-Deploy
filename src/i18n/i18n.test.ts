@@ -19,5 +19,6 @@ describe("i18n", () => {
   });
   it("interpolates", () => {
     expect(translate("en", "version", { v: "1.0" })).toBe("Version 1.0");
+    expect(translate("ru", "certCreated", { name: "A" })).toBe("Сертификат «A» готов.");
   });
 });
