@@ -32,7 +32,7 @@ What the important tests establish:
 |---|---|---|
 | Linux `.deb` and `.AppImage` | `npx tauri build --bundles deb,appimage` | built: 48 MB and 118 MB; package `easy-tizen`, depends on `libwebkit2gtk-4.1-0`, `libgtk-3-0` |
 | Linux binary | started under Xvfb; window captured (`docs/img/linux-window.png`) | starts, first-run guide rendered, data folder `io.github.volnalabs.easytizen` created |
-| Android APK (arm64) | `npx tauri android build --apk --target aarch64` | built, 11.6 MB; `aapt2` shows package `io.github.volnalabs.easytizen`, version 0.9.0, permissions INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE; no Samsung CLI inside |
+| Android APK + AAB (arm64 + armv7) | `npx tauri android build --apk --aab --target aarch64 armv7` with a throw-away signing key, as CI does | built: APK 18 MB, AAB 9.7 MB; `apksigner verify` passes; `aapt2` shows package `io.github.volnalabs.easytizen`, version 0.9.0, permissions INTERNET, ACCESS_NETWORK_STATE, ACCESS_WIFI_STATE; no Samsung CLI inside |
 | Interface | `scripts/screenshots.mjs` drives the real frontend through the whole flow on desktop and phone viewports with the demo backend | all 17 screens rendered without console errors |
 
 ## Not verified
@@ -42,7 +42,6 @@ What the important tests establish:
 * **Real Samsung Account / Samsung CA.**
 * **Windows and macOS:** installers are produced by CI only; not run by hand. Code-signing steps in CI have never run with real certificates.
 * **Real Tizen SDK installation** through the app (15 GB download) and the SDK engine's signing/installing with the genuine `tz`/`sdb`.
-* **Android armv7 build** and the signed APK/AAB path — exercised in CI, not locally.
 
 ## Tested TV models
 
