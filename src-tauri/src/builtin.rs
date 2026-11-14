@@ -415,6 +415,9 @@ fn stage_name(stage: InstallStage) -> &'static str {
     }
 }
 
+/// `(launched, profile name + password that proved correct)`.
+type InstallDone = (Option<bool>, Option<(String, String)>);
+
 pub async fn install(
     app: &AppHandle,
     state: &AppState,
