@@ -5,5 +5,5 @@
   "upstream_version": "1.7.0",
   "license": "Apache-2.0",
   "tree_sha256": "81aba695d2a2db8164b441040f480f76cf542fcfcd3f2daedd484cea98ac7638",
-  "note": "lib/tests removed; common/tools (dlog-analyzer binaries) NOT redistributed; package.json (type=commonjs) is TV Deploy's own and excluded from tree_sha256. Update with scripts/vendor-samsung-cli.sh"
+  "note": "lib/tests removed; common/tools (dlog-analyzer binaries) NOT redistributed; package.json (type=commonjs) is EasyTizen's own and excluded from tree_sha256. Update with scripts/vendor-samsung-cli.sh"
 }

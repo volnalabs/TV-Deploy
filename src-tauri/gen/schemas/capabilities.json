@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"Minimal permissions: window events (file drag & drop) and the native file picker. No shell, fs or process access from the frontend.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open"]}}
+{"default":{"identifier":"default","description":"Minimal permissions: window events (file drag & drop), progress events and the native file pickers. No shell, fs or process access from the frontend.","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save"]}}

@@ -39,7 +39,7 @@ pub struct Invocation {
 }
 
 impl Invocation {
-    /// `sdk-init-cli.js <sdkPath>` — writes `~/.tizen.sdk.path.config` (inside TV Deploy's
+    /// `sdk-init-cli.js <sdkPath>` — writes `~/.tizen.sdk.path.config` (inside EasyTizen's
     /// private HOME, see `runner`). `TIZEN_SDK_PATH` is deliberately ignored by the Samsung
     /// scripts (core/sdk.js `readSdkPath`), so this is the only supported way.
     pub fn sdk_init(sdk_path: &str) -> Result<Self, ValidationError> {

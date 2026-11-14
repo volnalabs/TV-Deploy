@@ -1,6 +1,6 @@
 [package]
 name = "easytizen"
-description = "A simple and modern application installer for Samsung Smart TVs."
+description = "The easy way to install apps on Samsung Smart TVs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

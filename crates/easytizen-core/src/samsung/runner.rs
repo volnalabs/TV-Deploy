@@ -26,7 +26,7 @@ pub struct Toolchain {
     /// Tizen SDK directory (used for pre-checks and for `sdk-init`). NOT passed via env:
     /// the Samsung scripts ignore `TIZEN_SDK_PATH` and read `<HOME>/.tizen.sdk.path.config`.
     pub sdk_path: PathBuf,
-    /// Private HOME for the Samsung scripts (`HOME` + `USERPROFILE`). Keeps TV Deploy's SDK
+    /// Private HOME for the Samsung scripts (`HOME` + `USERPROFILE`). Keeps EasyTizen's SDK
     /// pointer, certificates and profiles separate from a user's own Tizen Studio setup.
     pub home_dir: PathBuf,
 }
